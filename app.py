@@ -150,6 +150,33 @@ def find_row(df, possible_names, default=0.0):
                 return safe_scalar(df.loc[idx])
     return safe_scalar(default)
 
+def normalized_fcf_per_share(cashflow, shares, years=3):
+    """Average of the last `years` of free cash flow (OCF + capex), per share.
+
+    A single year's FCF is noisy — capex spikes (e.g. a data-center buildout)
+    can crush one year and wreck the whole DCF. Averaging the most recent few
+    years gives a far more stable base. Returns (fcf_per_share, n_years_used).
+    """
+    if cashflow is None or cashflow.empty or not shares:
+        return 0.0, 0
+    ocf_row = cashflow.loc['Operating Cash Flow'] if 'Operating Cash Flow' in cashflow.index else None
+    cap_row = None
+    for name in ['Capital Expenditure', 'Capital Expenditures']:
+        if name in cashflow.index:
+            cap_row = cashflow.loc[name]
+            break
+    if ocf_row is None:
+        return 0.0, 0
+    fcfs = []
+    for i in range(min(years, len(cashflow.columns))):
+        ocf = safe_scalar(ocf_row.iloc[i])
+        capex = safe_scalar(cap_row.iloc[i]) if cap_row is not None else 0.0
+        if ocf != 0:
+            fcfs.append(ocf + capex)
+    if not fcfs:
+        return 0.0, 0
+    return (float(np.mean(fcfs)) / shares), len(fcfs)
+
 # ---------- RISK FREE RATE ----------
 @lru_cache(maxsize=1)
 def get_risk_free_rate():
@@ -490,18 +517,19 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
             return None
 
         # ----- Fundamental data -----
-        ocf = find_row(cashflow, ['Operating Cash Flow'], 0.0)
-        capex = find_row(cashflow, ['Capital Expenditure', 'Capital Expenditures'], 0.0)
-        fcf_abs = ocf + capex
-        fcf_per_share = fcf_abs / shares
+        # Normalize FCF over several years so a single capex spike doesn't wreck
+        # the DCF (e.g. AMZN's data-center buildout collapsed one-year FCF).
+        fcf_per_share, n_years = normalized_fcf_per_share(cashflow, shares, years=3)
         cash_per_share = info.get('totalCash', 0) / shares
         debt_per_share = info.get('totalDebt', 0) / shares
+        if n_years >= 2:
+            console.print(f"[dim]✓ FCF base: {n_years}-yr average (smoothed)[/dim]")
 
-        # If FCF is zero or negative, use net income as proxy
+        # If normalized FCF is non-positive/negligible, fall back to net income.
         if fcf_per_share <= 0.1:
             net_income = find_row(financials, ['Net Income'], 0.0)
             fcf_per_share = net_income / shares
-            console.print("[dim]⚠️ FCF low, using net income for DCF.[/dim]")
+            console.print("[dim]⚠️ FCF low/negative, using net income for DCF.[/dim]")
 
         # ----- Growth & WACC -----
         growth = estimate_growth(ticker, financials, cashflow, info, shares)
@@ -525,7 +553,10 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
         val_base = dcf_per_share(fcf_per_share, growth, term_g, wacc, cash_per_share, debt_per_share)
         val_bear = dcf_per_share(fcf_per_share, growth*0.6, term_g, wacc+0.025, cash_per_share, debt_per_share)
         val_bull = dcf_per_share(fcf_per_share, growth*1.3, term_g, max(0.04, wacc-0.015), cash_per_share, debt_per_share)
-        mos = ((val_base - current_price) / val_base) * 100 if val_base > 0 else 0
+        # Upside/downside vs. price. Using price as the denominator keeps this
+        # bounded and intuitive; dividing by a tiny intrinsic value (the old
+        # formula) produced nonsensical readings like -3700%.
+        mos = ((val_base - current_price) / current_price) * 100 if current_price > 0 else 0
 
         # ----- Implied growth -----
         implied_g = implied_growth(current_price, fcf_per_share, wacc, cash_per_share, debt_per_share)
@@ -624,7 +655,7 @@ def render_dashboard(res):
     val_table.add_row("Bull (Optimistic)", f"[bold green]${safe_scalar(res['dcf']['bull']):.2f}[/bold green]")
     if res['mc']:
         val_table.add_row("Monte Carlo (5%-95%)", f"${res['mc']['lower']:.2f} → ${res['mc']['median']:.2f} → ${res['mc']['upper']:.2f}")
-    val_table.add_row("Margin of Safety", f"{safe_scalar(res['mos']):.1f}%" + (" 🟢" if res['mos'] > 20 else " 🟡" if res['mos'] > 0 else " 🔴"))
+    val_table.add_row("Upside vs Price", f"{safe_scalar(res['mos']):.1f}%" + (" 🟢" if res['mos'] > 20 else " 🟡" if res['mos'] > 0 else " 🔴"))
     val_table.add_row("Confidence", f"{safe_scalar(res['confidence']):.0f}/100")
 
     # Analyst & Market
@@ -734,7 +765,7 @@ def export_result(res, fmt):
             ("DCF Bear", r.get("dcf", {}).get("bear")),
             ("DCF Base", r.get("dcf", {}).get("base")),
             ("DCF Bull", r.get("dcf", {}).get("bull")),
-            ("Margin of Safety %", r.get("mos")),
+            ("Upside vs Price %", r.get("mos")),
             ("Confidence", r.get("confidence")),
             ("Growth Used", r.get("growth_used")),
             ("WACC Used", r.get("wacc_used")),
@@ -839,7 +870,7 @@ def run_compare(tickers, no_cache=False):
     table.add_column("Ticker", style="cyan")
     table.add_column("Price")
     table.add_column("Base DCF")
-    table.add_column("MOS %")
+    table.add_column("Upside %")
     table.add_column("Confidence")
     table.add_column("Growth")
     for r in sorted(results, key=lambda x: safe_scalar(x.get("confidence")), reverse=True):
@@ -935,13 +966,11 @@ def scenario(
     if not shares:
         console.print(f"[red]Missing share count for {ticker.upper()}.[/red]")
         raise typer.Exit(code=1)
-    ocf = find_row(cashflow, ['Operating Cash Flow'], 0.0)
-    capex = find_row(cashflow, ['Capital Expenditure', 'Capital Expenditures'], 0.0)
-    fcf_per_share = (ocf + capex) / shares
+    fcf_per_share, _ = normalized_fcf_per_share(cashflow, shares, years=3)
     cash_ps = info.get("totalCash", 0) / shares
     debt_ps = info.get("totalDebt", 0) / shares
     val = dcf_per_share(fcf_per_share, growth, terminal, wacc, cash_ps, debt_ps)
-    mos = ((val - current_price) / val) * 100 if val > 0 else 0
+    mos = ((val - current_price) / current_price) * 100 if current_price > 0 else 0
     table = Table(title=f"🎯 Scenario DCF • {ticker.upper()}", box=None)
     table.add_column("Input", style="cyan")
     table.add_column("Value")
@@ -951,7 +980,7 @@ def scenario(
     table.add_row("FCF / Share", f"${fcf_per_share:.2f}")
     table.add_row("Current Price", f"${safe_scalar(current_price):.2f}")
     table.add_row("Intrinsic Value", f"[bold gold1]${val:.2f}[/bold gold1]")
-    table.add_row("Margin of Safety", f"{mos:.1f}%")
+    table.add_row("Upside vs Price", f"{mos:.1f}%")
     console.print(table)
 
 @app.command()
