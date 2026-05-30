@@ -525,6 +525,51 @@ def revenue_margin_value(rev_ps0, g0, r, g_term, target_margin, exit_pe,
     tv_pct = tv_pv / (pv_earnings + tv_pv)
     return total, tv_pct
 
+# ---------- RESIDUAL-INCOME / JUSTIFIED-P/B MODEL (banks & insurers) ----------
+# Banks have no meaningful free cash flow (deposits/loans dominate), so growing
+# an FCFE/NI stream with a Gordon terminal massively overstates them (JPM showed
+# +57%, BARC.L +325%). Instead value them off equity: book value plus the
+# present value of *excess* returns over the cost of equity. With ROE=r the bank
+# is worth exactly book (P/B=1); a durable ROE>r earns a premium to book.
+def residual_income_value(bv0, roe0, r, g_term, payout, years=12,
+                          roe_sustainable=0.15):
+    """Two-stage residual-income equity value per share (statement currency).
+
+    Excess return ROE−r is earned on a book value that compounds at the
+    retention rate. ROE fades linearly from `roe0` to a `roe_sustainable`
+    long-run level over `years`; book grows by retained earnings each year. The
+    final-year residual income is capitalized as a perpetuity growing at
+    `g_term`. Returns (value, terminal_pct) or (None, None) on unusable inputs."""
+    if not bv0 or bv0 <= 0 or roe0 is None or r <= g_term:
+        return None, None
+    roe_term = max(r + 0.01, min(roe0, roe_sustainable))
+    retention = max(0.0, min(1.0, 1.0 - (payout or 0.0)))
+    bv = bv0
+    pv_ri = 0.0
+    for t in range(1, years + 1):
+        roe_t = roe0 - (roe0 - roe_term) * (t / years)
+        pv_ri += ((roe_t - r) * bv) / ((1 + r) ** t)
+        bv = bv * (1 + roe_t * retention)
+    ri_term = (roe_term - r) * bv
+    tv_pv = (ri_term * (1 + g_term) / (r - g_term)) / ((1 + r) ** years) if ri_term > 0 else 0.0
+    total = bv0 + pv_ri + tv_pv
+    if total <= 0:
+        return None, None
+    tv_pct = tv_pv / total if total > 0 else None
+    return total, tv_pct
+
+def bank_inputs_usable(bv, roe, eps):
+    """Guard yfinance's occasional garbage book/ROE for financials. Require a
+    positive book value and ROE, and (when EPS is available) that implied
+    earnings ROE·BV roughly agree with trailing EPS — else fall back to FCFE."""
+    if not bv or bv <= 0 or roe is None or roe <= 0:
+        return False
+    if eps and eps > 0:
+        implied = roe * bv
+        if implied <= 0 or implied / eps > 3.0 or implied / eps < 0.33:
+            return False
+    return True
+
 # ---------- IMPLIED GROWTH (Reverse DCF) ----------
 def implied_growth(current_price, base_fcfe, r, g_term, max_growth=0.40):
     """Solve for the stage-1 growth rate that makes the FCFE DCF equal today's
@@ -819,7 +864,27 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         pre_profit = base_fcfe <= 0
         nc_px = convert_currency(net_cash_ps, fin_ccy, px_ccy)
         price_fin = convert_currency(current_price, px_ccy, fin_ccy)
-        if pre_profit:
+        bank_bv = safe_scalar(info.get('bookValue'), 0.0)
+        bank_roe = info.get('returnOnEquity')
+        bank_payout = info.get('payoutRatio')
+        use_bank = is_bank and bank_inputs_usable(bank_bv, bank_roe, info.get('trailingEps'))
+        if use_bank:
+            # Banks: value off book + excess returns (residual income), not FCFE.
+            method = "residual_income"
+            pre_profit = False
+
+            def _bank_val(roe, sustain):
+                v, tvp = residual_income_value(bank_bv, roe, discount, g_term,
+                                               bank_payout, roe_sustainable=sustain)
+                if v is None:
+                    return None, None
+                return convert_currency(v, fin_ccy, px_ccy), tvp
+            val_base, tv_pct = _bank_val(bank_roe, 0.15)
+            val_bear, _ = _bank_val(bank_roe * 0.85, 0.12)
+            val_bull, _ = _bank_val(bank_roe * 1.10, 0.17)
+            mos = ((val_base - current_price) / current_price) * 100 if (val_base and current_price > 0) else None
+            implied_g = None
+        elif pre_profit:
             # FCFE is undefined for pre-profit names (negative base => $0). Value
             # the *future* profitable business off projected revenue instead.
             method = "rev_margin"
@@ -859,7 +924,7 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
 
         # ----- Monte Carlo (if enabled) -----
         mc_lower = mc_median = mc_upper = None
-        if cfg['use_monte_carlo'] and not pre_profit:
+        if cfg['use_monte_carlo'] and not pre_profit and not use_bank:
             percentiles, _ = monte_carlo_dcf(base_fcfe, g_start, discount, g_term, n_sims=cfg['num_simulations'])
             nc_px = convert_currency(net_cash_ps, fin_ccy, px_ccy)
             mc_lower, mc_median, mc_upper = [
@@ -906,6 +971,8 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             flags.append("📉 High short interest >20%")
         if pre_profit:
             flags.append("🌱 Pre-profit: valued via revenue→margin model (no current FCF)")
+        if use_bank:
+            flags.append("🏦 Bank: valued via residual income (book value + excess ROE)")
         if val_base is not None and val_base < current_price * 0.7:
             flags.append("🔴 Deeply overvalued (MOS < -30%)")
         if put_call_vol and put_call_vol > 1.2:
@@ -932,6 +999,8 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             "base_fcfe": base_fcfe,
             "base_mode": base_mode,
             "method": method,
+            "book_value": bank_bv if use_bank else None,
+            "roe": bank_roe if use_bank else None,
             "currency": px_ccy,
             "financial_currency": fin_ccy,
             "fx_applied": fx_applied,
@@ -1072,6 +1141,9 @@ def render_dashboard(res):
     fv_lbl = f"{cur} {fv:.2f}" if fv is not None else "n/a"
     if res.get('method') == 'rev_margin':
         base_part = "Base: revenue→margin (pre-profit)"
+    elif res.get('method') == 'residual_income':
+        bv = res.get('book_value')
+        base_part = f"Base: residual income (book {fin_ccy or cur} {bv:.2f}/sh, ROE {res.get('roe', 0):.1%})" if bv else "Base: residual income (book + excess ROE)"
     else:
         base_part = f"Base: {base_lbl} ({fin_ccy or cur} {res.get('base_fcfe', 0):.2f}/sh)"
     console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%}{crp_lbl} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | {base_part}{nc_lbl}{fx_lbl} | Fair value: {fv_lbl}[/dim]")
@@ -1300,12 +1372,10 @@ def run_validate(tickers, no_cache=True):
                 table.add_row(t.upper(), "-", "-", "-", "-", "-", "-", "-", f"[red]{verdict}[/red]")
                 continue
             cur = res.get("currency") or "USD"
-            if res.get("method") == "rev_margin":
-                method = "Rev→Margin"
-            elif res.get("base_mode") == "ni":
-                method = "Residual*"
-            else:
-                method = "FCFE"
+            method = {
+                "rev_margin": "Rev→Margin",
+                "residual_income": "Residual",
+            }.get(res.get("method"), "FCFE")
             fv = res["dcf"].get("base")
             fv_s = f"{fv:.2f}" if fv is not None else "n/a"
             tgt = res["analyst"].get("target_mean")
@@ -1320,7 +1390,7 @@ def run_validate(tickers, no_cache=True):
                 tgt_s, mos_s, tv_s, f"[{style}]{verdict}[/{style}]",
             )
     console.print(table)
-    console.print("[dim]* Residual income not yet implemented (PR3) — banks still on FCFE/NI.[/dim]")
+
     console.print(f"\n[bold]{n_ok}/{n_total} sane[/bold] "
                   f"({'all clear' if n_ok == n_total else 'see OUTLIER/FV<=0 rows'}).")
     return n_ok == n_total
