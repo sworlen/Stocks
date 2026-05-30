@@ -98,6 +98,28 @@ CAGR; target margins / exit multiples come from a built-in sector table
 floor** — names priced mostly on long-dated optionality (e.g. RKLB) can still
 trade well above it, which the dashboard flags.
 
+### Banks & insurers — residual-income / justified-P/B model
+
+Banks have no meaningful free cash flow (deposits/loans dominate the cash-flow
+statement), so an FCFE/NI DCF with a Gordon terminal badly overstates them
+(JPM read +57%, Barclays +325%). Financials are instead valued off **equity**:
+
+`value = book value + Σ PV(excess return) + PV(terminal residual income)`
+
+1. Excess return each year = `(ROE − cost of equity) × book value`. With ROE
+   equal to the cost of equity the bank is worth exactly book (P/B = 1); a
+   durable ROE above it earns a premium to book.
+2. ROE fades linearly from today's level to a **15% long-run ROE** over 12
+   years; book value compounds at the retention rate (`1 − payout`).
+3. The final-year residual income is capitalized as a perpetuity growing at the
+   terminal rate.
+
+Routed in for `sector == "Financial Services"` only, and only when the book
+value / ROE pass a sanity guard (positive, and `ROE × book ≈ trailing EPS`);
+otherwise the name falls back to the FCFE/NI path. Net cash is **not** added
+(deposits/debt are operational for a bank). Statement-currency in, price-currency
+out — so Barclays' GBP book correctly converts to a GBp (pence) fair value.
+
 ### Base cash-flow modes (`--base`)
 
 | mode   | base cash flow                                  | notes |
