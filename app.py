@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "wacc_max": 0.15,
     "equity_risk_premium": 0.05,
     "default_base": "ocf",
+    "add_net_cash": True,
     "confidence_weights": {
         "mos": 0.35,
         "analyst": 0.20,
@@ -186,6 +187,53 @@ def get_risk_free_rate():
 def get_market_risk_premium():
     # Using historical average 5-6% for US market
     return 0.055
+
+# ---------- CURRENCY NORMALIZATION ----------
+# Some venues quote prices in a *minor* unit (1/100 of the major currency) while
+# the financial statements are reported in the major unit. The classic trap is
+# London: a `.L` ticker's price currency is "GBp" (pence) but its statements are
+# in "GBP" — a silent 100x mismatch that wrecks any per-share comparison.
+MINOR_UNITS = {
+    "GBp": ("GBP", 100.0),   # pence
+    "GBX": ("GBP", 100.0),   # pence (alt code)
+    "ZAc": ("ZAR", 100.0),   # SA cents
+    "ILA": ("ILS", 100.0),   # Israeli agorot
+}
+
+def _major_unit(ccy):
+    """Return (major_currency, minor_per_major). For a normal currency this is
+    (ccy, 1.0); for a minor unit like GBp it's ('GBP', 100.0)."""
+    if not ccy:
+        return None, 1.0
+    return MINOR_UNITS.get(ccy, (ccy, 1.0))
+
+@lru_cache(maxsize=64)
+def get_fx_rate(from_ccy, to_ccy):
+    """Spot FX rate to convert 1 unit of `from_ccy` into `to_ccy` (major units).
+    Uses yfinance's `<PAIR>=X` quotes; returns 1.0 on failure or when equal."""
+    if not from_ccy or not to_ccy or from_ccy == to_ccy:
+        return 1.0
+    try:
+        hist = yf.Ticker(f"{from_ccy}{to_ccy}=X").history(period="5d")["Close"]
+        rate = safe_scalar(hist.iloc[-1]) if not hist.empty else 0.0
+        if rate > 0:
+            return float(rate)
+    except Exception:
+        pass
+    return 1.0
+
+def convert_currency(value, from_ccy, to_ccy):
+    """Convert a monetary `value` expressed in `from_ccy` into `to_ccy`,
+    correctly handling minor units (GBp/pence etc.) on either side."""
+    if value is None:
+        return value
+    from_major, from_div = _major_unit(from_ccy)
+    to_major, to_mult = _major_unit(to_ccy)
+    if not from_major or not to_major:
+        return value
+    rate = get_fx_rate(from_major, to_major)
+    # value(from minor) -> from major -> to major -> to minor
+    return value / from_div * rate * to_mult
 
 # ---------- SMART GROWTH ESTIMATION ----------
 def estimate_growth(ticker, financials, cashflow, info, shares):
@@ -332,15 +380,11 @@ def analyst_growth_rate(ticker, fallback):
     return fallback
 
 # ---------- 2-STAGE FCFE DCF (Simply Wall St style) ----------
-def fcfe_two_stage(base_fcfe, g_start, r, g_term, years=10):
-    """2-stage Free-Cash-Flow-to-Equity DCF.
-
-    Projects `years` of levered FCF with the growth rate fading linearly from
-    `g_start` to the long-run rate `g_term`, then a Gordon-Growth terminal
-    value, all discounted at the cost of equity `r`. Returns the equity value
-    in the same units as `base_fcfe` (per-share in, per-share out)."""
+def fcfe_two_stage_parts(base_fcfe, g_start, r, g_term, years=10):
+    """Split the 2-stage FCFE value into (PV of explicit cash flows, PV of the
+    terminal value). Returns (0.0, 0.0) when the model is undefined."""
     if base_fcfe <= 0 or r <= g_term:
-        return 0.0
+        return 0.0, 0.0
     cfs = []
     tmp = base_fcfe
     for t in range(1, years + 1):
@@ -349,7 +393,18 @@ def fcfe_two_stage(base_fcfe, g_start, r, g_term, years=10):
         cfs.append(tmp)
     pv = sum(c / ((1 + r) ** i) for i, c in enumerate(cfs, 1))
     tv = cfs[-1] * (1 + g_term) / (r - g_term)
-    return pv + tv / ((1 + r) ** years)
+    tv_pv = tv / ((1 + r) ** years)
+    return pv, tv_pv
+
+def fcfe_two_stage(base_fcfe, g_start, r, g_term, years=10):
+    """2-stage Free-Cash-Flow-to-Equity DCF.
+
+    Projects `years` of levered FCF with the growth rate fading linearly from
+    `g_start` to the long-run rate `g_term`, then a Gordon-Growth terminal
+    value, all discounted at the cost of equity `r`. Returns the equity value
+    in the same units as `base_fcfe` (per-share in, per-share out)."""
+    pv, tv_pv = fcfe_two_stage_parts(base_fcfe, g_start, r, g_term, years)
+    return pv + tv_pv
 
 def normalized_cash_earnings_ps(cashflow, financials, shares, mode='auto'):
     """Per-share base cash flow that the FCFE model grows from. `mode` selects
@@ -642,27 +697,65 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         # dominated by loan/deposit flows), so unless the user explicitly chose
         # a base, financials value off net income instead of the OCF default.
         sector = info.get('sector', 'Technology')
+        is_bank = sector == 'Financial Services'
         if not explicit_base:
             base_mode = load_config().get('default_base', 'ocf')
-            if sector == 'Financial Services' and base_mode == 'ocf':
+            if is_bank and base_mode == 'ocf':
                 base_mode = 'ni'
+
+        # ----- Currency normalization -----
+        # Statements are in `financialCurrency`; the quoted price is in
+        # `currency` (often a different currency for ADRs, or pence for `.L`).
+        # We value in the statement currency, then convert per-share values into
+        # the price currency so the upside/MOS comparison is apples-to-apples.
+        fin_ccy = info.get('financialCurrency') or info.get('currency')
+        px_ccy = info.get('currency') or fin_ccy
+        fx_applied = bool(fin_ccy and px_ccy and fin_ccy != px_ccy)
 
         # ----- 2-stage FCFE valuations (base, bear, bull) -----
         base_fcfe = normalized_cash_earnings_ps(cashflow, financials, shares, mode=base_mode)
-        val_base = fcfe_two_stage(base_fcfe, g_start, discount, g_term)
-        val_bear = fcfe_two_stage(base_fcfe, g_start * 0.6, discount + 0.015, g_term)
-        val_bull = fcfe_two_stage(base_fcfe, g_start * 1.25, max(g_term + 0.02, discount - 0.01), g_term)
-        # Upside/downside vs. price (bounded, intuitive).
-        mos = ((val_base - current_price) / current_price) * 100 if current_price > 0 else 0
+        # Net cash per share (cash - debt), a non-operating asset the FCFE stream
+        # doesn't capture. Skipped for banks, where debt/deposits are operational.
+        net_cash_ps = 0.0
+        if cfg.get('add_net_cash', True) and not is_bank:
+            total_cash = safe_scalar(info.get('totalCash'), 0.0)
+            total_debt = safe_scalar(info.get('totalDebt'), 0.0)
+            if shares:
+                net_cash_ps = (total_cash - total_debt) / shares
 
-        # ----- Implied growth (reverse DCF) -----
-        implied_g = implied_growth(current_price, base_fcfe, discount, g_term)
+        pre_profit = base_fcfe <= 0
+        if pre_profit:
+            # FCFE is undefined for pre-profit names (negative base => $0). Don't
+            # emit a misleading $0 / -100%; flag it and defer to the revenue model.
+            val_base = val_bear = val_bull = None
+            mos = None
+            implied_g = None
+            tv_pct = None
+        else:
+            def _val(g, r):
+                pv, tv_pv = fcfe_two_stage_parts(base_fcfe, g, r, g_term)
+                op = pv + tv_pv
+                op_px = convert_currency(op, fin_ccy, px_ccy)
+                nc_px = convert_currency(net_cash_ps, fin_ccy, px_ccy)
+                return op_px + nc_px, (tv_pv / op if op > 0 else None)
+            val_base, tv_pct = _val(g_start, discount)
+            val_bear, _ = _val(g_start * 0.6, discount + 0.015)
+            val_bull, _ = _val(g_start * 1.25, max(g_term + 0.02, discount - 0.01))
+            # Upside/downside vs. price (bounded, intuitive).
+            mos = ((val_base - current_price) / current_price) * 100 if current_price > 0 else 0
+            # ----- Implied growth (reverse DCF) -----
+            # Compare in statement currency: convert the price back, net of cash.
+            price_fin = convert_currency(current_price, px_ccy, fin_ccy)
+            implied_g = implied_growth(max(0.0, price_fin - net_cash_ps), base_fcfe, discount, g_term)
 
         # ----- Monte Carlo (if enabled) -----
         mc_lower = mc_median = mc_upper = None
-        if cfg['use_monte_carlo']:
+        if cfg['use_monte_carlo'] and not pre_profit:
             percentiles, _ = monte_carlo_dcf(base_fcfe, g_start, discount, g_term, n_sims=cfg['num_simulations'])
-            mc_lower, mc_median, mc_upper = percentiles
+            nc_px = convert_currency(net_cash_ps, fin_ccy, px_ccy)
+            mc_lower, mc_median, mc_upper = [
+                convert_currency(float(p), fin_ccy, px_ccy) + nc_px for p in percentiles
+            ]
 
         # ----- Analyst & Short, Options -----
         analyst_counts, t_mean, t_median, t_high, t_low = get_analyst_ratings(ticker)
@@ -687,7 +780,7 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         piotroski = None  # simplified, left as previous
         technical = get_technicals(ticker, period="1y")
         extra = get_extra_metrics(ticker, info, financials, cashflow, balancesheet, shares, current_price)
-        confidence = compute_confidence(mos, analyst_counts, technical, extra)
+        confidence = compute_confidence(mos if mos is not None else 0.0, analyst_counts, technical, extra)
 
         # ----- Peer percentiles -----
         pe = info.get('trailingPE', 0)
@@ -702,12 +795,18 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             flags.append("⚠️ Low FCF yield (<2%)")
         if short_float and short_float > 20:
             flags.append("📉 High short interest >20%")
-        if val_base < current_price * 0.7:
+        if pre_profit:
+            flags.append("🌱 Pre-profit: FCFE n/a (revenue model needed — see roadmap)")
+        elif val_base is not None and val_base < current_price * 0.7:
             flags.append("🔴 Deeply overvalued (MOS < -30%)")
         if put_call_vol and put_call_vol > 1.2:
             flags.append("🐻 Elevated put/call ratio")
         if implied_g and implied_g > 0.15:
             flags.append(f"📈 Market expects {implied_g:.0%} growth (unrealistic)")
+        if fx_applied:
+            flags.append(f"💱 FX-normalized: statements {fin_ccy} → price {px_ccy}")
+        if tv_pct is not None and tv_pct > 0.75:
+            flags.append(f"⏳ {tv_pct:.0%} of value is terminal (fragile)")
 
         result = {
             "ticker": ticker_symbol.upper(),
@@ -723,6 +822,12 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             "terminal_growth": g_term,
             "base_fcfe": base_fcfe,
             "base_mode": base_mode,
+            "currency": px_ccy,
+            "financial_currency": fin_ccy,
+            "fx_applied": fx_applied,
+            "net_cash_ps": net_cash_ps,
+            "pre_profit": pre_profit,
+            "tv_pct": tv_pct,
             "implied_growth": implied_g,
             "mc": {"lower": mc_lower, "median": mc_median, "upper": mc_upper} if mc_lower else None,
             "analyst": {"ratings": dict(analyst_counts), "target_mean": t_mean, "target_median": t_median, "target_high": t_high, "target_low": t_low},
@@ -748,15 +853,22 @@ def render_dashboard(res):
     console.print(Panel.fit(f"[bold gold1]🧠 AEGIS OMNISCIENT v12.0 • {res['name']} ({res['ticker']}) • 1Y+ Valuation[/bold gold1]"))
 
     # Valuation table
-    val_table = Table(title="💎 DCF Intrinsic Value", box=None)
+    cur = res.get('currency') or 'USD'
+    def _money(v):
+        return f"{cur} {v:.2f}" if v is not None else "[dim]n/a[/dim]"
+    val_table = Table(title="💎 Intrinsic Value", box=None)
     val_table.add_column("Scenario", style="cyan")
     val_table.add_column("Target")
-    val_table.add_row("Bear (Stress)", f"${safe_scalar(res['dcf']['bear']):.2f}")
-    val_table.add_row("Base Case", f"[bold gold1]${safe_scalar(res['dcf']['base']):.2f}[/bold gold1]")
-    val_table.add_row("Bull (Optimistic)", f"[bold green]${safe_scalar(res['dcf']['bull']):.2f}[/bold green]")
+    val_table.add_row("Bear (Stress)", _money(res['dcf']['bear']))
+    val_table.add_row("Base Case", f"[bold gold1]{_money(res['dcf']['base'])}[/bold gold1]")
+    val_table.add_row("Bull (Optimistic)", f"[bold green]{_money(res['dcf']['bull'])}[/bold green]")
     if res['mc']:
-        val_table.add_row("Monte Carlo (5%-95%)", f"${res['mc']['lower']:.2f} → ${res['mc']['median']:.2f} → ${res['mc']['upper']:.2f}")
-    val_table.add_row("Upside vs Price", f"{safe_scalar(res['mos']):.1f}%" + (" 🟢" if res['mos'] > 20 else " 🟡" if res['mos'] > 0 else " 🔴"))
+        val_table.add_row("Monte Carlo (5%-95%)", f"{_money(res['mc']['lower'])} → {_money(res['mc']['median'])} → {_money(res['mc']['upper'])}")
+    if res.get('mos') is not None:
+        mos = res['mos']
+        val_table.add_row("Upside vs Price", f"{mos:.1f}%" + (" 🟢" if mos > 20 else " 🟡" if mos > 0 else " 🔴"))
+    else:
+        val_table.add_row("Upside vs Price", "[dim]n/a (pre-profit)[/dim]")
     val_table.add_row("Confidence", f"{safe_scalar(res['confidence']):.0f}/100")
 
     # Analyst & Market
@@ -842,7 +954,13 @@ def render_dashboard(res):
     base_lbl = {'ni': 'net income', 'ocf': 'operating cash flow', 'fcf': '3yr-avg FCF', 'auto': 'normalized'}.get(res.get('base_mode', 'auto'), 'normalized')
     crp = res.get('country_risk_premium', 0.0)
     crp_lbl = f" (incl. {crp:.1%} country risk)" if crp and crp > 0 else ""
-    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%}{crp_lbl} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Base: {base_lbl} (${res.get('base_fcfe', 0):.2f}/sh) | Fair value: ${res['dcf']['base']:.2f}[/dim]")
+    fin_ccy = res.get('financial_currency')
+    fx_lbl = f" | Statements: {fin_ccy}→{cur}" if res.get('fx_applied') else ""
+    nc = res.get('net_cash_ps')
+    nc_lbl = f" | Net cash: {cur} {nc:+.2f}/sh" if nc else ""
+    fv = res['dcf']['base']
+    fv_lbl = f"{cur} {fv:.2f}" if fv is not None else "n/a (pre-profit)"
+    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%}{crp_lbl} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Base: {base_lbl} ({fin_ccy or cur} {res.get('base_fcfe', 0):.2f}/sh){nc_lbl}{fx_lbl} | Fair value: {fv_lbl}[/dim]")
 
 # ---------- WATCHLIST HELPERS ----------
 def load_watchlist():
@@ -988,18 +1106,99 @@ def run_compare(tickers, no_cache=False):
     table.add_column("Confidence")
     table.add_column("Growth")
     for r in sorted(results, key=lambda x: safe_scalar(x.get("confidence")), reverse=True):
-        mos = safe_scalar(r.get("mos"))
-        mos_str = f"{mos:.1f}%" + (" 🟢" if mos > 20 else " 🟡" if mos > 0 else " 🔴")
+        cur = r.get("currency") or "USD"
+        base = r['dcf'].get('base')
+        base_str = f"{cur} {base:.2f}" if base is not None else "n/a"
+        mos = r.get("mos")
+        if mos is None:
+            mos_str = "n/a 🌱"
+        else:
+            mos_str = f"{mos:.1f}%" + (" 🟢" if mos > 20 else " 🟡" if mos > 0 else " 🔴")
         table.add_row(
             r["ticker"],
-            f"${safe_scalar(r.get('price')):.2f}",
-            f"${safe_scalar(r['dcf'].get('base')):.2f}",
+            f"{cur} {safe_scalar(r.get('price')):.2f}",
+            base_str,
             mos_str,
             f"{safe_scalar(r.get('confidence')):.0f}/100",
             f"{safe_scalar(r.get('growth_used')):.1%}",
         )
     console.print(table)
     return True
+
+# ---------- VALIDATION HARNESS ----------
+# A diverse basket spanning the archetypes the engine must handle: megacap,
+# banks (US/EM/UK), semis, autos, staples/healthcare, pre-profit growth, EM
+# high-growth, and foreign listings. Used as a regression check.
+VALIDATION_BASKET = [
+    "AMZN", "JPM", "NU", "BARC.L", "TSM", "ASML", "RACE", "PEP", "JNJ",
+    "OUST", "RKLB", "MELI", "7974.T",
+]
+
+def _sanity(res):
+    """Heuristic sanity verdict for one analysis result. Returns (label, ok)."""
+    if res is None:
+        return "no-data", False
+    if res.get("pre_profit"):
+        return "pre-profit (deferred)", True  # expected gap, not a failure
+    fv = res["dcf"].get("base")
+    if not fv or fv <= 0:
+        return "FV<=0", False
+    # Compare to analyst target (preferred) or price, in the same currency.
+    ref = res["analyst"].get("target_mean") or res.get("price")
+    if not ref or ref <= 0:
+        return "no reference", True
+    ratio = fv / ref
+    if 0.4 <= ratio <= 2.5:
+        return f"ok ({ratio:.2f}x)", True
+    return f"OUTLIER ({ratio:.2f}x)", False
+
+def run_validate(tickers, no_cache=True):
+    """Run the basket and print FV vs price vs analyst target with a sanity
+    verdict per name — the regression harness for valuation changes."""
+    table = Table(title="🧪 Valuation Validation Harness")
+    table.add_column("Ticker", style="cyan")
+    table.add_column("Method")
+    table.add_column("Ccy")
+    table.add_column("Fair Value", justify="right")
+    table.add_column("Price", justify="right")
+    table.add_column("Analyst Tgt", justify="right")
+    table.add_column("Upside", justify="right")
+    table.add_column("TV%", justify="right")
+    table.add_column("Verdict")
+    n_ok = 0
+    n_total = 0
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  transient=True) as progress:
+        task = progress.add_task("Validating...", total=None)
+        for t in tickers:
+            progress.update(task, description=f"Analyzing {t.upper()}...")
+            res = analyze_ticker(t, use_cache=not no_cache)
+            n_total += 1
+            verdict, ok = _sanity(res)
+            n_ok += 1 if ok else 0
+            if res is None:
+                table.add_row(t.upper(), "-", "-", "-", "-", "-", "-", "-", f"[red]{verdict}[/red]")
+                continue
+            cur = res.get("currency") or "USD"
+            method = "Rev→Margin*" if res.get("pre_profit") else ("Residual*" if res.get("base_mode") == "ni" else "FCFE")
+            fv = res["dcf"].get("base")
+            fv_s = f"{fv:.2f}" if fv is not None else "n/a"
+            tgt = res["analyst"].get("target_mean")
+            tgt_s = f"{tgt:.2f}" if tgt else "-"
+            mos = res.get("mos")
+            mos_s = f"{mos:+.0f}%" if mos is not None else "n/a"
+            tv = res.get("tv_pct")
+            tv_s = f"{tv:.0%}" if tv is not None else "-"
+            style = "green" if ok else "red"
+            table.add_row(
+                res["ticker"], method, cur, fv_s, f"{safe_scalar(res.get('price')):.2f}",
+                tgt_s, mos_s, tv_s, f"[{style}]{verdict}[/{style}]",
+            )
+    console.print(table)
+    console.print("[dim]* method not yet implemented (PR2/PR3) — currently FCFE/flagged.[/dim]")
+    console.print(f"\n[bold]{n_ok}/{n_total} sane[/bold] "
+                  f"({'all clear' if n_ok == n_total else 'see OUTLIER/FV<=0 rows'}).")
+    return n_ok == n_total
 
 # ---------- CLI COMMANDS ----------
 @app.callback(invoke_without_command=True)
@@ -1033,6 +1232,17 @@ def compare(
 ):
     """Compare key valuation metrics across multiple tickers."""
     if not run_compare(tickers, no_cache=no_cache):
+        raise typer.Exit(code=1)
+
+@app.command()
+def validate(
+    tickers: list[str] = typer.Argument(None, help="Tickers to validate (default: built-in archetype basket)"),
+    no_cache: bool = typer.Option(True, "--no-cache/--cache", help="Refetch instead of using cache"),
+):
+    """Regression harness: value a diverse basket and flag $0 / outlier / garbage results."""
+    basket = [t.upper() for t in tickers] if tickers else VALIDATION_BASKET
+    ok = run_validate(basket, no_cache=no_cache)
+    if not ok:
         raise typer.Exit(code=1)
 
 @app.command()

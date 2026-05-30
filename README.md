@@ -35,6 +35,9 @@ python app.py scenario AMZN -g 0.22 -d 0.085 -t 0.036   # custom DCF inputs
 
 python app.py config --show               # print current configuration
 python app.py config -s default_base=auto # set a config key
+
+python app.py validate                    # regression harness over a diverse basket
+python app.py validate AAPL NU BARC.L     # validate specific tickers
 ```
 
 Run `python app.py --help` (or `python app.py <command> --help`) for all options.
@@ -58,6 +61,30 @@ The intrinsic value is a **2-stage FCFE DCF**:
 **Bull / Base / Bear** scenarios vary the growth and discount assumptions around
 the base case.
 
+### Currency normalization
+
+Financial statements are reported in `financialCurrency` (e.g. EUR for ASML/RACE,
+GBP for `.L` listings) while the quoted price is in `currency` (often USD for ADRs,
+or **GBp/pence** for London). The engine values in the statement currency, then
+converts the per-share result into the price currency (handling the GBp = 1/100
+GBP "pence trap") so the upside/MOS comparison is apples-to-apples. The currency
+is shown in the dashboard, and an FX-normalization flag is raised when conversion
+is applied.
+
+### Net cash
+
+For non-financials, **net cash per share** (`totalCash − totalDebt`) is added to
+the operating value — a balance-sheet asset the FCFE stream doesn't capture
+(e.g. Nintendo's large cash pile). Disable via `add_net_cash=false`. Skipped for
+banks, where debt/deposits are operational, not excess cash.
+
+### Pre-profit companies
+
+FCFE is undefined when the base cash flow is negative (early-stage growth names
+like OUST/RKLB). Rather than printing a misleading `$0.00 / -100%`, these are
+flagged **pre-profit** and the intrinsic value shows `n/a` pending the dedicated
+revenue→margin model (roadmap).
+
 ### Base cash-flow modes (`--base`)
 
 | mode   | base cash flow                                  | notes |
@@ -79,6 +106,7 @@ Settings live in `aegis_config.json` (auto-created with defaults). Key fields:
 |---------------------|---------|---------|
 | `default_ticker`    | `AAPL`  | ticker used when `single` is called with no argument |
 | `default_base`      | `ocf`   | FCFE base mode (see above) |
+| `add_net_cash`      | `true`  | add net cash per share to non-financials |
 | `max_stage1_growth` | `0.20`  | cap on stage-1 growth |
 | `min_growth`        | `0.01`  | floor on stage-1 growth |
 | `equity_risk_premium` | `0.05` | equity risk premium used in CAPM |
