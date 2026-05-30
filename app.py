@@ -16,18 +16,16 @@ import numpy as np
 import pandas as pd
 import json
 import os
-import sys
 import math
-import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 from functools import lru_cache
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.columns import Columns
-from rich.prompt import Prompt, Confirm
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.prompt import Prompt
+from rich.progress import Progress, SpinnerColumn, TextColumn
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -99,7 +97,26 @@ def cache_get(key, expiry_hours=6):
 def cache_set(key, value):
     path = os.path.join(CACHE_DIR, f"{key}.json")
     with open(path, "w") as f:
-        json.dump({"ts": datetime.now().timestamp(), "value": value}, f)
+        json.dump({"ts": datetime.now().timestamp(), "value": to_json_safe(value)}, f)
+
+# ---------- JSON-SAFE SERIALIZATION ----------
+def to_json_safe(obj):
+    """Recursively convert numpy / pandas scalars and containers into plain
+    Python types so results can be cached and exported as JSON."""
+    if isinstance(obj, dict):
+        return {str(k): to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_json_safe(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        val = float(obj)
+        return None if math.isnan(val) else val
+    if isinstance(obj, np.ndarray):
+        return [to_json_safe(v) for v in obj.tolist()]
+    if isinstance(obj, float):
+        return None if math.isnan(obj) else obj
+    return obj
 
 # ---------- SAFE SCALAR ----------
 def safe_scalar(value, default=0.0):
@@ -139,7 +156,7 @@ def get_risk_free_rate():
     try:
         tnx = yf.Ticker("^TNX").history(period="1d")['Close'].iloc[-1]
         return safe_scalar(tnx) / 100
-    except:
+    except Exception:
         return 0.042
 
 # ---------- MARKET RISK PREMIUM ----------
@@ -158,11 +175,12 @@ def estimate_growth(ticker, financials, cashflow, info, shares):
         est = ticker.earnings_estimate
         if est is not None and 'avg' in est.index:
             val = safe_scalar(est.loc['avg'].iloc[0])
-            if val > 1: val /= 100
+            if val > 1:
+                val /= 100
             if cfg['min_growth'] <= val <= cfg['max_growth']:
                 growth_candidates.append(val)
                 sources.append("Analyst LT growth")
-    except:
+    except Exception:
         pass
 
     # 2) Historical revenue CAGR (last 5 years)
@@ -178,7 +196,7 @@ def estimate_growth(ticker, financials, cashflow, info, shares):
             if cfg['min_growth'] <= cagr <= cfg['max_growth']:
                 growth_candidates.append(cagr)
                 sources.append("Historical revenue CAGR")
-    except:
+    except Exception:
         pass
 
     # 3) Sustainable growth (ROE * retention ratio)
@@ -193,7 +211,7 @@ def estimate_growth(ticker, financials, cashflow, info, shares):
             if cfg['min_growth'] <= sustainable <= cfg['max_growth']:
                 growth_candidates.append(sustainable)
                 sources.append("Sustainable (ROE×retention)")
-    except:
+    except Exception:
         pass
 
     # 4) Historical FCF/share growth (last 5 years)
@@ -208,7 +226,7 @@ def estimate_growth(ticker, financials, cashflow, info, shares):
             if cfg['min_growth'] <= cagr <= cfg['max_growth']:
                 growth_candidates.append(cagr)
                 sources.append("Historical FCF CAGR")
-    except:
+    except Exception:
         pass
 
     # Choose the best (median of candidates, or default 8%)
@@ -308,7 +326,7 @@ def get_analyst_ratings(ticker):
                         counts['strong_sell'] += 1
                 info = ticker.info
                 return counts, info.get('targetMeanPrice'), info.get('targetMedianPrice'), info.get('targetHighPrice'), info.get('targetLowPrice')
-    except:
+    except Exception:
         pass
     return {"strong_buy":0, "buy":0, "hold":0, "sell":0, "strong_sell":0}, None, None, None, None
 
@@ -340,7 +358,7 @@ def get_peer_percentiles(ticker_symbol, sector, current_pe, current_ev_ebitda):
                 pe_vals.append(pe)
             if ev and ev > 0:
                 ev_vals.append(ev)
-        except:
+        except Exception:
             pass
     if not pe_vals:
         return 50, 50
@@ -366,7 +384,14 @@ def get_technicals(ticker, period="6mo"):
     macd = exp1 - exp2
     signal = macd.ewm(span=9, adjust=False).mean()
     macd_hist = safe_scalar((macd - signal).iloc[-1] if not macd.empty else 0)
-    spy = yf.download("SPY", period=period, progress=False)['Close']
+    try:
+        spy_df = yf.download("SPY", period=period, progress=False, auto_adjust=True)
+        spy = spy_df['Close']
+        # Newer yfinance returns multi-index columns -> 'Close' is a DataFrame.
+        if isinstance(spy, pd.DataFrame):
+            spy = spy.iloc[:, 0]
+    except Exception:
+        spy = pd.Series(dtype=float)
     if not spy.empty:
         stock_ret = safe_scalar(close.pct_change().iloc[-20:].mean() * 252)
         spy_ret = safe_scalar(spy.pct_change().iloc[-20:].mean() * 252)
@@ -399,7 +424,7 @@ def get_extra_metrics(ticker, info, financials, cashflow, balancesheet, shares, 
         fcf_abs = cfo + (safe_scalar(cashflow.loc['Capital Expenditure'].iloc[0]) if 'Capital Expenditure' in cashflow.index else 0)
         metrics['fcf_yield'] = (fcf_abs / (current_price * shares)) * 100 if current_price and shares else None
         return metrics
-    except:
+    except Exception:
         return {}
 
 # ---------- CONFIDENCE SCORE ----------
@@ -445,7 +470,13 @@ def compute_confidence(mos, analyst_counts, technical, extra):
     return confidence * 100
 
 # ---------- MAIN ANALYSIS (v12) ----------
-def analyze_ticker(ticker_symbol: str):
+def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
+    cache_key = f"analysis_{ticker_symbol.upper()}"
+    if use_cache:
+        cached = cache_get(cache_key, expiry_hours=6)
+        if cached:
+            console.print(f"[dim]✓ Loaded {ticker_symbol.upper()} from cache (<6h old)[/dim]")
+            return cached
     try:
         ticker = yf.Ticker(ticker_symbol)
         info = ticker.info
@@ -498,7 +529,6 @@ def analyze_ticker(ticker_symbol: str):
 
         # ----- Implied growth -----
         implied_g = implied_growth(current_price, fcf_per_share, wacc, cash_per_share, debt_per_share)
-        implied_g_pct = implied_g * 100 if implied_g else None
 
         # ----- Monte Carlo (if enabled) -----
         mc_lower = mc_median = mc_upper = None
@@ -522,7 +552,7 @@ def analyze_ticker(ticker_symbol: str):
                 calls_vol = safe_scalar(chain.calls['volume'].sum())
                 puts_vol = safe_scalar(chain.puts['volume'].sum())
                 put_call_vol = puts_vol / calls_vol if calls_vol != 0 else None
-        except:
+        except Exception:
             put_call_vol = None
 
         # ----- Quality & Technicals -----
@@ -552,7 +582,7 @@ def analyze_ticker(ticker_symbol: str):
         if implied_g and implied_g > 0.15:
             flags.append(f"📈 Market expects {implied_g:.0%} growth (unrealistic)")
 
-        return {
+        result = {
             "ticker": ticker_symbol.upper(),
             "name": info.get('longName', ticker_symbol),
             "price": current_price,
@@ -572,6 +602,10 @@ def analyze_ticker(ticker_symbol: str):
             "peer_percentiles": {"pe": pe_percentile, "ev_ebitda": ev_percentile},
             "risk_flags": flags
         }
+        result = to_json_safe(result)
+        if use_cache:
+            cache_set(cache_key, result)
+        return result
     except Exception as e:
         console.print(f"[red]Analysis error for {ticker_symbol}: {e}[/red]")
         return None
@@ -643,7 +677,7 @@ def render_dashboard(res):
     panels = [Panel(val_table), Panel(anal_table), Panel(qual_table), Panel(tech_table)]
     try:
         console.print(Columns(panels, width=120))
-    except:
+    except Exception:
         for p in panels:
             console.print(p)
 
@@ -665,13 +699,303 @@ def render_dashboard(res):
     console.print(Panel(rec, title="Aegis Conviction", border_style="magenta"))
     console.print(f"[dim]WACC: {res['wacc_used']:.1%} | Target: ${res['dcf']['base']:.2f}[/dim]")
 
-# ---------- CLI COMMANDS (same as before, but export enhanced) ----------
-# (For brevity, I'm keeping the same CLI structure as v11.6, but you can copy from previous version)
-# The full script is long; I'll provide the rest in a downloadable format.
+# ---------- WATCHLIST HELPERS ----------
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [str(t).upper() for t in data]
+        except Exception:
+            pass
+    return []
 
-# For the final answer, I'll include the full script as a single code block.
+def save_watchlist(tickers):
+    unique = sorted({str(t).upper() for t in tickers})
+    with open(WATCHLIST_FILE, "w") as f:
+        json.dump(unique, f, indent=2)
+    return unique
 
-# ... (the rest of CLI: single, compare, watchlist, add, remove, scenario, config, main)
+# ---------- EXPORT ----------
+def export_result(res, fmt):
+    """Export a single analysis result. Returns the path written, or None."""
+    fmt = fmt.lower()
+    ticker = res.get("ticker", "UNKNOWN")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = os.path.join(REPORT_DIR, f"{ticker}_{stamp}")
+    safe = to_json_safe(res)
+
+    def _flat_rows(r):
+        return [
+            ("Ticker", r.get("ticker")),
+            ("Name", r.get("name")),
+            ("Price", r.get("price")),
+            ("DCF Bear", r.get("dcf", {}).get("bear")),
+            ("DCF Base", r.get("dcf", {}).get("base")),
+            ("DCF Bull", r.get("dcf", {}).get("bull")),
+            ("Margin of Safety %", r.get("mos")),
+            ("Confidence", r.get("confidence")),
+            ("Growth Used", r.get("growth_used")),
+            ("WACC Used", r.get("wacc_used")),
+            ("Implied Growth", r.get("implied_growth")),
+        ]
+
+    if fmt == "json":
+        path = base + ".json"
+        with open(path, "w") as f:
+            json.dump(safe, f, indent=2)
+        return path
+
+    if fmt == "csv":
+        import csv
+        path = base + ".csv"
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Metric", "Value"])
+            for k, v in _flat_rows(safe):
+                writer.writerow([k, v])
+        return path
+
+    if fmt in ("excel", "xlsx"):
+        if not HAS_OPENPYXL:
+            console.print("[yellow]openpyxl not installed; skipping Excel export.[/yellow]")
+            return None
+        path = base + ".xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Valuation"
+        ws.append(["Metric", "Value"])
+        for k, v in _flat_rows(safe):
+            ws.append([k, v])
+        wb.save(path)
+        return path
+
+    if fmt == "pdf":
+        if not HAS_FPDF:
+            console.print("[yellow]fpdf2 not installed; skipping PDF export.[/yellow]")
+            return None
+        path = base + ".pdf"
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, f"Aegis Valuation - {ticker}", ln=True)
+        pdf.set_font("Helvetica", size=11)
+        for k, v in _flat_rows(safe):
+            pdf.cell(0, 8, f"{k}: {v}", ln=True)
+        if safe.get("risk_flags"):
+            pdf.ln(4)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 8, "Risk Flags", ln=True)
+            pdf.set_font("Helvetica", size=11)
+            for flag in safe["risk_flags"]:
+                # fpdf core fonts are latin-1 only; drop unsupported glyphs (emoji).
+                clean = flag.encode("latin-1", "ignore").decode("latin-1").strip()
+                pdf.cell(0, 8, clean or "- flag", ln=True)
+        pdf.output(path)
+        return path
+
+    console.print(f"[red]Unknown export format: {fmt}[/red]")
+    return None
+
+# ---------- CLI HELPERS (plain functions, callable internally) ----------
+def run_single(ticker, export=None, monte_carlo=False, no_cache=False):
+    """Analyze one ticker and render its dashboard. Returns True on success."""
+    if not ticker:
+        ticker = Prompt.ask("Ticker", default=load_config()["default_ticker"])
+    if monte_carlo:
+        cfg = load_config()
+        cfg["use_monte_carlo"] = True
+        save_config(cfg)
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  transient=True) as progress:
+        progress.add_task(f"Analyzing {ticker.upper()}...", total=None)
+        res = analyze_ticker(ticker, use_cache=not no_cache)
+    if not res:
+        console.print(f"[red]Could not analyze {ticker.upper()}. Check the symbol and try again.[/red]")
+        return False
+    render_dashboard(res)
+    if export:
+        path = export_result(res, export)
+        if path:
+            console.print(f"[green]✓ Exported to {path}[/green]")
+    return True
+
+def run_compare(tickers, no_cache=False):
+    """Analyze multiple tickers and render a comparison table. Returns True on success."""
+    results = []
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  transient=True) as progress:
+        task = progress.add_task("Analyzing...", total=None)
+        for t in tickers:
+            progress.update(task, description=f"Analyzing {t.upper()}...")
+            res = analyze_ticker(t, use_cache=not no_cache)
+            if res:
+                results.append(res)
+    if not results:
+        console.print("[red]No tickers could be analyzed.[/red]")
+        return False
+    table = Table(title="📊 Comparison")
+    table.add_column("Ticker", style="cyan")
+    table.add_column("Price")
+    table.add_column("Base DCF")
+    table.add_column("MOS %")
+    table.add_column("Confidence")
+    table.add_column("Growth")
+    for r in sorted(results, key=lambda x: safe_scalar(x.get("confidence")), reverse=True):
+        mos = safe_scalar(r.get("mos"))
+        mos_str = f"{mos:.1f}%" + (" 🟢" if mos > 20 else " 🟡" if mos > 0 else " 🔴")
+        table.add_row(
+            r["ticker"],
+            f"${safe_scalar(r.get('price')):.2f}",
+            f"${safe_scalar(r['dcf'].get('base')):.2f}",
+            mos_str,
+            f"{safe_scalar(r.get('confidence')):.0f}/100",
+            f"{safe_scalar(r.get('growth_used')):.1%}",
+        )
+    console.print(table)
+    return True
+
+# ---------- CLI COMMANDS ----------
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context):
+    """🧠 Aegis Omniscient v12.0 – run a subcommand, or omit one to analyze the default ticker."""
+    if ctx.invoked_subcommand is None:
+        cfg = load_config()
+        console.print(f"[dim]No command given; analyzing default ticker {cfg['default_ticker']}.[/dim]")
+        if not run_single(cfg["default_ticker"]):
+            raise typer.Exit(code=1)
+
+@app.command()
+def single(
+    ticker: str = typer.Argument(None, help="Ticker symbol, e.g. AAPL"),
+    export: str = typer.Option(None, "--export", "-e", help="Export format: json, csv, excel, pdf"),
+    monte_carlo: bool = typer.Option(False, "--monte-carlo", "-m", help="Run Monte Carlo simulation"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Ignore cached results and refetch"),
+):
+    """Full valuation dashboard for a single ticker."""
+    if not run_single(ticker, export=export, monte_carlo=monte_carlo, no_cache=no_cache):
+        raise typer.Exit(code=1)
+
+@app.command()
+def compare(
+    tickers: list[str] = typer.Argument(..., help="Two or more tickers, e.g. AAPL MSFT GOOGL"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Ignore cached results and refetch"),
+):
+    """Compare key valuation metrics across multiple tickers."""
+    if not run_compare(tickers, no_cache=no_cache):
+        raise typer.Exit(code=1)
+
+@app.command()
+def add(ticker: str = typer.Argument(..., help="Ticker to add to the watchlist")):
+    """Add a ticker to your watchlist."""
+    wl = load_watchlist()
+    wl.append(ticker.upper())
+    wl = save_watchlist(wl)
+    console.print(f"[green]✓ Added {ticker.upper()}.[/green] Watchlist: {', '.join(wl)}")
+
+@app.command()
+def remove(ticker: str = typer.Argument(..., help="Ticker to remove from the watchlist")):
+    """Remove a ticker from your watchlist."""
+    wl = load_watchlist()
+    if ticker.upper() not in wl:
+        console.print(f"[yellow]{ticker.upper()} is not in the watchlist.[/yellow]")
+        raise typer.Exit(code=1)
+    wl = [t for t in wl if t != ticker.upper()]
+    save_watchlist(wl)
+    console.print(f"[green]✓ Removed {ticker.upper()}.[/green] Watchlist: {', '.join(wl) or '(empty)'}")
+
+@app.command()
+def watchlist(no_cache: bool = typer.Option(False, "--no-cache", help="Ignore cached results and refetch")):
+    """Analyze every ticker in your watchlist as a comparison table."""
+    wl = load_watchlist()
+    if not wl:
+        console.print("[yellow]Watchlist is empty. Add tickers with: app.py add TICKER[/yellow]")
+        raise typer.Exit(code=1)
+    if not run_compare(wl, no_cache=no_cache):
+        raise typer.Exit(code=1)
+
+@app.command()
+def scenario(
+    ticker: str = typer.Argument(..., help="Ticker symbol"),
+    growth: float = typer.Option(..., "--growth", "-g", help="Annual FCF growth rate, e.g. 0.10 for 10%"),
+    wacc: float = typer.Option(0.09, "--wacc", "-w", help="Discount rate (WACC)"),
+    terminal: float = typer.Option(0.025, "--terminal", "-t", help="Terminal growth rate"),
+):
+    """Custom DCF: supply your own growth, WACC and terminal-growth assumptions."""
+    tk = yf.Ticker(ticker)
+    try:
+        info = tk.info
+        cashflow = tk.cashflow
+    except Exception as e:
+        console.print(f"[red]Could not fetch data for {ticker.upper()}: {e}[/red]")
+        raise typer.Exit(code=1)
+    shares = info.get("sharesOutstanding", 0)
+    current_price = info.get("currentPrice", info.get("previousClose", 0))
+    if not shares:
+        console.print(f"[red]Missing share count for {ticker.upper()}.[/red]")
+        raise typer.Exit(code=1)
+    ocf = find_row(cashflow, ['Operating Cash Flow'], 0.0)
+    capex = find_row(cashflow, ['Capital Expenditure', 'Capital Expenditures'], 0.0)
+    fcf_per_share = (ocf + capex) / shares
+    cash_ps = info.get("totalCash", 0) / shares
+    debt_ps = info.get("totalDebt", 0) / shares
+    val = dcf_per_share(fcf_per_share, growth, terminal, wacc, cash_ps, debt_ps)
+    mos = ((val - current_price) / val) * 100 if val > 0 else 0
+    table = Table(title=f"🎯 Scenario DCF • {ticker.upper()}", box=None)
+    table.add_column("Input", style="cyan")
+    table.add_column("Value")
+    table.add_row("Growth", f"{growth:.1%}")
+    table.add_row("WACC", f"{wacc:.1%}")
+    table.add_row("Terminal Growth", f"{terminal:.1%}")
+    table.add_row("FCF / Share", f"${fcf_per_share:.2f}")
+    table.add_row("Current Price", f"${safe_scalar(current_price):.2f}")
+    table.add_row("Intrinsic Value", f"[bold gold1]${val:.2f}[/bold gold1]")
+    table.add_row("Margin of Safety", f"{mos:.1f}%")
+    console.print(table)
+
+@app.command()
+def config(
+    show: bool = typer.Option(False, "--show", help="Print the current configuration"),
+    set_: list[str] = typer.Option(None, "--set", "-s", help="Set a key, e.g. --set default_ticker=MSFT"),
+):
+    """View or update configuration."""
+    cfg = load_config()
+    if set_:
+        for pair in set_:
+            if "=" not in pair:
+                console.print(f"[yellow]Ignoring '{pair}' (expected key=value).[/yellow]")
+                continue
+            key, value = pair.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key not in DEFAULT_CONFIG:
+                console.print(f"[yellow]Unknown key '{key}'. Valid keys: {', '.join(DEFAULT_CONFIG)}[/yellow]")
+                continue
+            # Coerce to the type of the default value.
+            default = DEFAULT_CONFIG[key]
+            try:
+                if isinstance(default, bool):
+                    coerced = value.lower() in ("1", "true", "yes", "y", "on")
+                elif isinstance(default, int) and not isinstance(default, bool):
+                    coerced = int(value)
+                elif isinstance(default, float):
+                    coerced = float(value)
+                else:
+                    coerced = value
+            except ValueError:
+                console.print(f"[red]Could not parse value for {key}: {value}[/red]")
+                continue
+            cfg[key] = coerced
+            console.print(f"[green]✓ {key} = {coerced}[/green]")
+        save_config(cfg)
+    if show or not set_:
+        table = Table(title="⚙️  Configuration", box=None)
+        table.add_column("Key", style="cyan")
+        table.add_column("Value")
+        for k, v in cfg.items():
+            table.add_row(k, json.dumps(v) if isinstance(v, dict) else str(v))
+        console.print(table)
 
 if __name__ == "__main__":
     app()
