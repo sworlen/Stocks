@@ -120,6 +120,31 @@ otherwise the name falls back to the FCFE/NI path. Net cash is **not** added
 (deposits/debt are operational for a bank). Statement-currency in, price-currency
 out — so Barclays' GBP book correctly converts to a GBp (pence) fair value.
 
+### Blended fair value (the headline)
+
+No single model is right for every name, and even the right model can be thrown
+off by one bad input — float inflates MercadoLibre's FCFE to ~3× its earnings
+power, and a missing year of Nintendo data deflates its FCFE base to near zero.
+So the **headline fair value is a confidence-weighted blend** of three views:
+
+| component | what it is | base weight |
+|-----------|------------|-------------|
+| intrinsic | the model value (FCFE / residual income / revenue→margin) | 0.45 |
+| analyst   | mean analyst target | 0.35 |
+| multiples | normalized EPS × sector peer P/E (`MULTIPLE_PE`), currency-converted | 0.20 |
+
+When the intrinsic estimate **diverges sharply** from the multiples/analyst
+consensus (more than 2.5× above or below their median) **or rests mostly on
+terminal value** (TV > 75%), its weight is halved and redistributed — so an
+inflated, deflated, or fragile DCF can't drive the headline alone. Components
+with no data (e.g. multiples for a pre-profit name) drop out and the remaining
+weights renormalize. All components stay visible on the dashboard, and a
+`⚖️` flag is shown whenever the headline leans on the blend.
+
+This is what turns the last outliers sane: MercadoLibre's +198% intrinsic blends
+down toward its analyst target, and Nintendo's deflated intrinsic blends up to a
+sensible peer/earnings value. The validation harness reports **13/13 sane**.
+
 ### Base cash-flow modes (`--base`)
 
 | mode   | base cash flow                                  | notes |

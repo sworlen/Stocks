@@ -570,6 +570,53 @@ def bank_inputs_usable(bv, roe, eps):
             return False
     return True
 
+# ---------- MULTIPLES CROSS-CHECK + BLENDED FAIR VALUE ----------
+# Peer-multiple P/E by sector — a sanity anchor for "what is the equity worth at
+# a normal earnings multiple?". Used to reconcile DCF extremes (fintech float
+# inflates FCFE; data glitches deflate it) against analyst targets via a
+# confidence-weighted blend, so no single bad input drives the headline.
+MULTIPLE_PE = {
+    "Technology": 25.0, "Communication Services": 22.0, "Healthcare": 22.0,
+    "Consumer Cyclical": 20.0, "Consumer Defensive": 20.0, "Industrials": 22.0,
+    "Energy": 12.0, "Basic Materials": 14.0, "Real Estate": 18.0,
+    "Utilities": 16.0, "Financial Services": 13.0,
+}
+DEFAULT_PE = 20.0
+
+def multiples_fair_value(info, sector, fin_ccy, px_ccy):
+    """Peer-multiple equity value per share: normalized EPS × sector P/E,
+    converted to the price currency. EPS is reported in the statement currency.
+    Returns None when there's no positive earnings (e.g. pre-profit names)."""
+    eps_cands = [safe_scalar(info.get(k)) for k in ('forwardEps', 'trailingEps')]
+    eps_cands = [e for e in eps_cands if e and e > 0]
+    if not eps_cands:
+        return None
+    norm_eps = float(np.median(eps_cands))
+    pe = MULTIPLE_PE.get(sector, DEFAULT_PE)
+    return convert_currency(norm_eps * pe, fin_ccy, px_ccy)
+
+def blended_fair_value(intrinsic, multiples, analyst, tv_pct=None):
+    """Confidence-weighted blend of the intrinsic value, a peer-multiple value,
+    and the analyst target — the headline fair value. An intrinsic estimate that
+    diverges sharply from the multiples/analyst consensus, or that rests mostly
+    on terminal value, is downweighted so a single inflated/deflated/fragile DCF
+    can't drive the headline. Returns (blend, weights_dict)."""
+    vals = {"intrinsic": intrinsic, "analyst": analyst, "multiples": multiples}
+    base_w = {"intrinsic": 0.45, "analyst": 0.35, "multiples": 0.20}
+    others = [v for k, v in vals.items() if k != "intrinsic" and v and v > 0]
+    if intrinsic and intrinsic > 0 and others:
+        ref = float(np.median(others))
+        ratio = intrinsic / ref if ref > 0 else 1.0
+        if ratio > 2.5 or ratio < 0.4 or (tv_pct is not None and tv_pct > 0.75):
+            base_w["intrinsic"] *= 0.5
+    weights = {k: base_w[k] for k, v in vals.items() if v and v > 0}
+    tot = sum(weights.values())
+    if tot <= 0:
+        return intrinsic, {}
+    weights = {k: w / tot for k, w in weights.items()}
+    blend = sum(vals[k] * w for k, w in weights.items())
+    return blend, weights
+
 # ---------- IMPLIED GROWTH (Reverse DCF) ----------
 def implied_growth(current_price, base_fcfe, r, g_term, max_growth=0.40):
     """Solve for the stage-1 growth rate that makes the FCFE DCF equal today's
@@ -956,6 +1003,14 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         extra = get_extra_metrics(ticker, info, financials, cashflow, balancesheet, shares, current_price)
         confidence = compute_confidence(mos if mos is not None else 0.0, analyst_counts, technical, extra)
 
+        # ----- Multiples cross-check + blended (headline) fair value -----
+        # Reconcile the intrinsic value with a peer-multiple value and the
+        # analyst target so float-inflated DCFs (MELI), data glitches (Nintendo)
+        # or fragile terminal values don't drive the headline on their own.
+        multiples_val = multiples_fair_value(info, sector, fin_ccy, px_ccy)
+        blended_val, blend_weights = blended_fair_value(val_base, multiples_val, t_mean, tv_pct=tv_pct)
+        blended_mos = ((blended_val - current_price) / current_price) * 100 if (blended_val and current_price > 0) else None
+
         # ----- Peer percentiles -----
         pe = info.get('trailingPE', 0)
         ev_ebitda = info.get('enterpriseToEbitda', 0)
@@ -983,12 +1038,18 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             flags.append(f"💱 FX-normalized: statements {fin_ccy} → price {px_ccy}")
         if tv_pct is not None and tv_pct > 0.75:
             flags.append(f"⏳ {tv_pct:.0%} of value is terminal (fragile)")
+        if blended_val and val_base and val_base > 0 and (val_base / blended_val > 1.5 or val_base / blended_val < 0.67):
+            flags.append("⚖️ Intrinsic diverges from peers/analysts; headline is a blend")
 
         result = {
             "ticker": ticker_symbol.upper(),
             "name": info.get('longName', ticker_symbol),
             "price": current_price,
             "dcf": {"bear": val_bear, "base": val_base, "bull": val_bull},
+            "multiples_value": multiples_val,
+            "blended_value": blended_val,
+            "blended_weights": blend_weights,
+            "blended_mos": blended_mos,
             "mos": mos,
             "confidence": confidence,
             "growth_used": g_start,
@@ -1039,11 +1100,21 @@ def render_dashboard(res):
     val_table.add_column("Scenario", style="cyan")
     val_table.add_column("Target")
     val_table.add_row("Bear (Stress)", _money(res['dcf']['bear']))
-    val_table.add_row("Base Case", f"[bold gold1]{_money(res['dcf']['base'])}[/bold gold1]")
+    val_table.add_row("Base (Intrinsic)", _money(res['dcf']['base']))
     val_table.add_row("Bull (Optimistic)", f"[bold green]{_money(res['dcf']['bull'])}[/bold green]")
+    if res.get('multiples_value') is not None:
+        val_table.add_row("Peer Multiple", _money(res['multiples_value']))
+    if res['analyst'].get('target_mean'):
+        val_table.add_row("Analyst Target", _money(res['analyst']['target_mean']))
     if res['mc']:
         val_table.add_row("Monte Carlo (5%-95%)", f"{_money(res['mc']['lower'])} → {_money(res['mc']['median'])} → {_money(res['mc']['upper'])}")
-    if res.get('mos') is not None:
+    blended = res.get('blended_value')
+    if blended is not None:
+        val_table.add_row("[bold]Blended Fair Value[/bold]", f"[bold gold1]{_money(blended)}[/bold gold1]")
+    bmos = res.get('blended_mos')
+    if bmos is not None:
+        val_table.add_row("Upside vs Price", f"{bmos:.1f}%" + (" 🟢" if bmos > 20 else " 🟡" if bmos > 0 else " 🔴"))
+    elif res.get('mos') is not None:
         mos = res['mos']
         val_table.add_row("Upside vs Price", f"{mos:.1f}%" + (" 🟢" if mos > 20 else " 🟡" if mos > 0 else " 🔴"))
     else:
@@ -1137,8 +1208,8 @@ def render_dashboard(res):
     fx_lbl = f" | Statements: {fin_ccy}→{cur}" if res.get('fx_applied') else ""
     nc = res.get('net_cash_ps')
     nc_lbl = f" | Net cash: {cur} {nc:+.2f}/sh" if nc else ""
-    fv = res['dcf']['base']
-    fv_lbl = f"{cur} {fv:.2f}" if fv is not None else "n/a"
+    fv = res.get('blended_value') if res.get('blended_value') is not None else res['dcf']['base']
+    fv_lbl = f"{cur} {fv:.2f} (blended)" if res.get('blended_value') is not None else (f"{cur} {fv:.2f}" if fv is not None else "n/a")
     if res.get('method') == 'rev_margin':
         base_part = "Base: revenue→margin (pre-profit)"
     elif res.get('method') == 'residual_income':
@@ -1324,7 +1395,8 @@ def _sanity(res):
     """Heuristic sanity verdict for one analysis result. Returns (label, ok)."""
     if res is None:
         return "no-data", False
-    fv = res["dcf"].get("base")
+    # The headline is the confidence-weighted blend; fall back to intrinsic.
+    fv = res.get("blended_value") or res["dcf"].get("base")
     pre = res.get("pre_profit")
     if fv is None and pre:
         return "pre-profit (no rev)", True  # revenue model couldn't seed; tolerated
@@ -1376,11 +1448,11 @@ def run_validate(tickers, no_cache=True):
                 "rev_margin": "Rev→Margin",
                 "residual_income": "Residual",
             }.get(res.get("method"), "FCFE")
-            fv = res["dcf"].get("base")
+            fv = res.get("blended_value") or res["dcf"].get("base")
             fv_s = f"{fv:.2f}" if fv is not None else "n/a"
             tgt = res["analyst"].get("target_mean")
             tgt_s = f"{tgt:.2f}" if tgt else "-"
-            mos = res.get("mos")
+            mos = res.get("blended_mos") if res.get("blended_mos") is not None else res.get("mos")
             mos_s = f"{mos:+.0f}%" if mos is not None else "n/a"
             tv = res.get("tv_pct")
             tv_s = f"{tv:.0%}" if tv is not None else "-"
