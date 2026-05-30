@@ -63,6 +63,7 @@ DEFAULT_CONFIG = {
     "use_monte_carlo": False,
     "num_simulations": 5000,
     "max_growth": 0.20,
+    "max_stage1_growth": 0.20,
     "min_growth": 0.01,
     "wacc_min": 0.045,
     "wacc_max": 0.15,
@@ -267,13 +268,43 @@ def estimate_growth(ticker, financials, cashflow, info, shares):
         console.print("[dim]✓ Growth: default 8% (sector average)[/dim]")
     return growth
 
+# ---------- COUNTRY RISK PREMIUM ----------
+# Damodaran-style equity country-risk premiums (approximate, mid-2024; refresh
+# periodically). Developed markets ≈ 0; emerging markets carry a premium for
+# sovereign/FX risk. Keyed on yfinance's info['country'] (HQ country).
+COUNTRY_RISK_PREMIUM = {
+    # developed (no premium)
+    "United States": 0.0, "Canada": 0.0, "United Kingdom": 0.0, "Germany": 0.0,
+    "France": 0.0, "Switzerland": 0.0, "Netherlands": 0.0, "Sweden": 0.0,
+    "Norway": 0.0, "Denmark": 0.0, "Australia": 0.0, "New Zealand": 0.0,
+    "Japan": 0.0058, "Singapore": 0.0, "Ireland": 0.0058, "Hong Kong": 0.0057,
+    "Taiwan": 0.0057, "South Korea": 0.0086,
+    # emerging
+    "China": 0.0086, "India": 0.0231, "Brazil": 0.0345, "Mexico": 0.0173,
+    "Uruguay": 0.0173, "Chile": 0.0115, "Colombia": 0.0288, "Peru": 0.0173,
+    "Argentina": 0.1265, "South Africa": 0.0345, "Indonesia": 0.0173,
+    "Philippines": 0.0173, "Thailand": 0.0144, "Malaysia": 0.0115,
+    "Turkey": 0.0691, "Russia": 0.0750, "Nigeria": 0.0750, "Egypt": 0.0750,
+    "Saudi Arabia": 0.0086, "United Arab Emirates": 0.0058, "Israel": 0.0086,
+    "Poland": 0.0115, "Greece": 0.0345, "Italy": 0.0173, "Spain": 0.0115,
+    "Portugal": 0.0144, "Vietnam": 0.0288,
+}
+
+def country_risk_premium(country):
+    """Equity country-risk premium for a company's HQ country (0 if unknown
+    or developed)."""
+    if not country:
+        return 0.0
+    return COUNTRY_RISK_PREMIUM.get(country.strip(), 0.0)
+
 # ---------- COST OF EQUITY (CAPM) ----------
-def cost_of_equity(beta, rf, erp):
+def cost_of_equity(beta, rf, erp, crp=0.0):
     """CAPM cost of equity with a Blume-adjusted, bounded beta (the discount
-    rate used by Simply-Wall-St-style FCFE models)."""
+    rate used by Simply-Wall-St-style FCFE models), plus an additive country
+    risk premium `crp` for sovereign/FX risk in emerging markets."""
     adj_beta = 0.67 * beta + 0.33          # Blume adjustment toward the market
     adj_beta = max(0.8, min(2.0, adj_beta))
-    return rf + adj_beta * erp
+    return rf + adj_beta * erp + crp
 
 # ---------- LONG-RUN (TERMINAL) GROWTH ----------
 @lru_cache(maxsize=1)
@@ -600,11 +631,13 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         cfg = load_config()
         growth = estimate_growth(ticker, financials, cashflow, info, shares)
         g_start = analyst_growth_rate(ticker, growth)
-        g_start = max(cfg['min_growth'], min(0.30, g_start))
+        growth_cap = cfg.get('max_stage1_growth', 0.20)
+        g_start = max(cfg['min_growth'], min(growth_cap, g_start))
         rf = get_risk_free_rate()
         erp = cfg.get('equity_risk_premium', get_market_risk_premium())
         beta = max(0.4, info.get('beta', 1.0) or 1.0)
-        discount = cost_of_equity(beta, rf, erp)
+        crp = country_risk_premium(info.get('country'))
+        discount = cost_of_equity(beta, rf, erp, crp)
         g_term = get_longrun_growth()
         if g_term >= discount:
             g_term = discount - 0.02
@@ -684,6 +717,7 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             "growth_used": g_start,
             "wacc_used": discount,
             "discount_rate": discount,
+            "country_risk_premium": crp,
             "terminal_growth": g_term,
             "base_fcfe": base_fcfe,
             "base_mode": base_mode,
@@ -794,7 +828,9 @@ def render_dashboard(res):
         rec = "[bold red]STRONG SELL[/bold red] 🔴"
     console.print(Panel(rec, title="Aegis Conviction", border_style="magenta"))
     base_lbl = {'ni': 'net income', 'ocf': 'operating cash flow', 'fcf': '3yr-avg FCF', 'auto': 'normalized'}.get(res.get('base_mode', 'auto'), 'normalized')
-    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Base: {base_lbl} (${res.get('base_fcfe', 0):.2f}/sh) | Fair value: ${res['dcf']['base']:.2f}[/dim]")
+    crp = res.get('country_risk_premium', 0.0)
+    crp_lbl = f" (incl. {crp:.1%} country risk)" if crp and crp > 0 else ""
+    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%}{crp_lbl} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Base: {base_lbl} (${res.get('base_fcfe', 0):.2f}/sh) | Fair value: ${res['dcf']['base']:.2f}[/dim]")
 
 # ---------- WATCHLIST HELPERS ----------
 def load_watchlist():
