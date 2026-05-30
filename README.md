@@ -78,12 +78,25 @@ the operating value — a balance-sheet asset the FCFE stream doesn't capture
 (e.g. Nintendo's large cash pile). Disable via `add_net_cash=false`. Skipped for
 banks, where debt/deposits are operational, not excess cash.
 
-### Pre-profit companies
+### Pre-profit companies — revenue→margin model
 
 FCFE is undefined when the base cash flow is negative (early-stage growth names
-like OUST/RKLB). Rather than printing a misleading `$0.00 / -100%`, these are
-flagged **pre-profit** and the intrinsic value shows `n/a` pending the dedicated
-revenue→margin model (roadmap).
+like OUST/RKLB), so those names are routed to a **revenue→margin** model instead
+of printing a misleading `$0.00`:
+
+1. Grow revenue/share from today, holding the seed growth for a few years
+   (hyper-growth plateau) then fading to the terminal rate.
+2. Ramp the net margin from today's (negative) level to a **sector-normal
+   target margin**.
+3. Discount positive interim earnings at the cost of equity and capitalize the
+   final-year earnings at a **sector exit P/E**.
+4. Deflate for stock-comp **dilution**, then add net cash.
+
+The seed growth blends reported YoY revenue growth with the historical revenue
+CAGR; target margins / exit multiples come from a built-in sector table
+(`SECTOR_MARGIN_EXIT`). This is a deliberately **conservative fundamental
+floor** — names priced mostly on long-dated optionality (e.g. RKLB) can still
+trade well above it, which the dashboard flags.
 
 ### Base cash-flow modes (`--base`)
 

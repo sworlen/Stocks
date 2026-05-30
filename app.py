@@ -432,6 +432,99 @@ def normalized_cash_earnings_ps(cashflow, financials, shares, mode='auto'):
         return max(candidates)
     return nfcf if nfcf else ni_ps
 
+# ---------- REVENUE → MARGIN MODEL (pre-profit companies) ----------
+# Mature, steady-state net margin and exit P/E by sector. Pre-profit growth
+# names (lidar, space, SaaS) have no usable cash flow yet, so we value the
+# *future* profitable business: grow revenue, ramp to a sector-normal margin,
+# then capitalize. Figures are deliberately conservative peer medians.
+SECTOR_MARGIN_EXIT = {
+    "Technology":             (0.15, 25.0),
+    "Communication Services": (0.15, 22.0),
+    "Healthcare":             (0.14, 22.0),
+    "Consumer Cyclical":      (0.08, 20.0),
+    "Consumer Defensive":     (0.09, 20.0),
+    "Industrials":            (0.10, 22.0),
+    "Energy":                 (0.10, 12.0),
+    "Basic Materials":        (0.10, 14.0),
+    "Real Estate":            (0.20, 18.0),
+    "Utilities":              (0.10, 16.0),
+}
+DEFAULT_MARGIN_EXIT = (0.10, 20.0)
+
+def sector_margin_exit(sector):
+    """(target steady-state net margin, exit P/E) for a sector."""
+    return SECTOR_MARGIN_EXIT.get(sector, DEFAULT_MARGIN_EXIT)
+
+def revenue_growth_seed(info, financials, cap_hi=0.40, floor=0.05):
+    """Stage-1 revenue growth for the revenue→margin model: blend of the latest
+    YoY revenue growth and the historical revenue CAGR, clamped to a sane band."""
+    cands = []
+    rg = info.get('revenueGrowth')
+    if rg and rg > 0:
+        cands.append(float(rg))
+    try:
+        if financials is not None and 'Total Revenue' in financials.index:
+            vals = []
+            for i in range(min(5, len(financials.columns))):
+                v = safe_scalar(financials.loc['Total Revenue'].iloc[i])
+                if v > 0:
+                    vals.append(v)
+            if len(vals) >= 3:
+                cagr = (vals[0] / vals[-1]) ** (1 / (len(vals) - 1)) - 1
+                if cagr > 0:
+                    cands.append(cagr)
+    except Exception:
+        pass
+    g = float(np.median(cands)) if cands else 0.15
+    return max(floor, min(cap_hi, g))
+
+def annual_dilution(cashflow, financials, shares, price_fin):
+    """Approximate yearly share-count dilution from stock-based comp: SBC per
+    share / price. Pre-profit names pay staff heavily in stock, so ignoring this
+    overstates per-share value. Bounded to [0, 6%]."""
+    if not shares or not price_fin or price_fin <= 0:
+        return 0.0
+    sbc = find_row(cashflow, ['Stock Based Compensation', 'StockBasedCompensation',
+                              'Stock Based Compensation Expense'], 0.0)
+    if sbc <= 0:
+        return 0.0
+    dil = (sbc / shares) / price_fin
+    return max(0.0, min(0.06, dil))
+
+def revenue_margin_value(rev_ps0, g0, r, g_term, target_margin, exit_pe,
+                         cur_margin, dilution=0.0, years=12, plateau=4):
+    """Value a pre-profit company off projected revenue.
+
+    Hyper-growth names sustain high growth for years before maturing, so growth
+    holds at `g0` for `plateau` years, then fades linearly to `g_term` by year
+    `years` (a flat fade-from-year-1 badly undervalues them). The net margin
+    ramps from today's `cur_margin` to the sector `target_margin`; positive
+    interim earnings are discounted at `r` and year-N earnings capitalized at
+    `exit_pe`. Per-share value is deflated for annual `dilution`. Statement-
+    currency in, statement-currency out. Returns (value, tv_pct) or (None, None)."""
+    if rev_ps0 is None or rev_ps0 <= 0 or r <= g_term:
+        return None, None
+    rev = rev_ps0
+    pv_earnings = 0.0
+    for t in range(1, years + 1):
+        if t <= plateau:
+            g = g0
+        else:
+            g = g0 - (g0 - g_term) * ((t - plateau) / (years - plateau))
+        rev *= (1 + g)
+        m = cur_margin + (target_margin - cur_margin) * (t / years)
+        eps_t = rev * m
+        if eps_t > 0:
+            pv_earnings += eps_t / ((1 + r) ** t)
+    eps_n = rev * target_margin
+    tv_pv = (eps_n * exit_pe) / ((1 + r) ** years)
+    total = pv_earnings + tv_pv
+    if total <= 0:
+        return None, None
+    total /= ((1 + dilution) ** years)
+    tv_pct = tv_pv / (pv_earnings + tv_pv)
+    return total, tv_pct
+
 # ---------- IMPLIED GROWTH (Reverse DCF) ----------
 def implied_growth(current_price, base_fcfe, r, g_term, max_growth=0.40):
     """Solve for the stage-1 growth rate that makes the FCFE DCF equal today's
@@ -724,19 +817,36 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
                 net_cash_ps = (total_cash - total_debt) / shares
 
         pre_profit = base_fcfe <= 0
+        nc_px = convert_currency(net_cash_ps, fin_ccy, px_ccy)
+        price_fin = convert_currency(current_price, px_ccy, fin_ccy)
         if pre_profit:
-            # FCFE is undefined for pre-profit names (negative base => $0). Don't
-            # emit a misleading $0 / -100%; flag it and defer to the revenue model.
-            val_base = val_bear = val_bull = None
-            mos = None
+            # FCFE is undefined for pre-profit names (negative base => $0). Value
+            # the *future* profitable business off projected revenue instead.
+            method = "rev_margin"
+            rev_ps0 = find_row(financials, ['Total Revenue', 'TotalRevenue',
+                                            'Operating Revenue'], 0.0) / shares
+            g0 = revenue_growth_seed(info, financials, cap_hi=0.50)
+            tgt_margin, exit_pe = sector_margin_exit(sector)
+            cur_margin = max(-0.5, min(tgt_margin, safe_scalar(info.get('profitMargins'), 0.0)))
+            dil = annual_dilution(cashflow, financials, shares, price_fin)
+
+            def _rev_val(g, m, pe):
+                v, tvp = revenue_margin_value(rev_ps0, g, discount, g_term, m, pe,
+                                              cur_margin, dilution=dil)
+                if v is None:
+                    return None, None
+                return convert_currency(v, fin_ccy, px_ccy) + nc_px, tvp
+            val_base, tv_pct = _rev_val(g0, tgt_margin, exit_pe)
+            val_bear, _ = _rev_val(g0 * 0.7, tgt_margin * 0.7, exit_pe * 0.8)
+            val_bull, _ = _rev_val(min(0.60, g0 * 1.2), tgt_margin * 1.2, exit_pe * 1.15)
+            mos = ((val_base - current_price) / current_price) * 100 if (val_base and current_price > 0) else None
             implied_g = None
-            tv_pct = None
         else:
+            method = "fcfe"
             def _val(g, r):
                 pv, tv_pv = fcfe_two_stage_parts(base_fcfe, g, r, g_term)
                 op = pv + tv_pv
                 op_px = convert_currency(op, fin_ccy, px_ccy)
-                nc_px = convert_currency(net_cash_ps, fin_ccy, px_ccy)
                 return op_px + nc_px, (tv_pv / op if op > 0 else None)
             val_base, tv_pct = _val(g_start, discount)
             val_bear, _ = _val(g_start * 0.6, discount + 0.015)
@@ -745,7 +855,6 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             mos = ((val_base - current_price) / current_price) * 100 if current_price > 0 else 0
             # ----- Implied growth (reverse DCF) -----
             # Compare in statement currency: convert the price back, net of cash.
-            price_fin = convert_currency(current_price, px_ccy, fin_ccy)
             implied_g = implied_growth(max(0.0, price_fin - net_cash_ps), base_fcfe, discount, g_term)
 
         # ----- Monte Carlo (if enabled) -----
@@ -796,8 +905,8 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         if short_float and short_float > 20:
             flags.append("📉 High short interest >20%")
         if pre_profit:
-            flags.append("🌱 Pre-profit: FCFE n/a (revenue model needed — see roadmap)")
-        elif val_base is not None and val_base < current_price * 0.7:
+            flags.append("🌱 Pre-profit: valued via revenue→margin model (no current FCF)")
+        if val_base is not None and val_base < current_price * 0.7:
             flags.append("🔴 Deeply overvalued (MOS < -30%)")
         if put_call_vol and put_call_vol > 1.2:
             flags.append("🐻 Elevated put/call ratio")
@@ -822,6 +931,7 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             "terminal_growth": g_term,
             "base_fcfe": base_fcfe,
             "base_mode": base_mode,
+            "method": method,
             "currency": px_ccy,
             "financial_currency": fin_ccy,
             "fx_applied": fx_applied,
@@ -959,8 +1069,12 @@ def render_dashboard(res):
     nc = res.get('net_cash_ps')
     nc_lbl = f" | Net cash: {cur} {nc:+.2f}/sh" if nc else ""
     fv = res['dcf']['base']
-    fv_lbl = f"{cur} {fv:.2f}" if fv is not None else "n/a (pre-profit)"
-    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%}{crp_lbl} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Base: {base_lbl} ({fin_ccy or cur} {res.get('base_fcfe', 0):.2f}/sh){nc_lbl}{fx_lbl} | Fair value: {fv_lbl}[/dim]")
+    fv_lbl = f"{cur} {fv:.2f}" if fv is not None else "n/a"
+    if res.get('method') == 'rev_margin':
+        base_part = "Base: revenue→margin (pre-profit)"
+    else:
+        base_part = f"Base: {base_lbl} ({fin_ccy or cur} {res.get('base_fcfe', 0):.2f}/sh)"
+    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%}{crp_lbl} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | {base_part}{nc_lbl}{fx_lbl} | Fair value: {fv_lbl}[/dim]")
 
 # ---------- WATCHLIST HELPERS ----------
 def load_watchlist():
@@ -1138,9 +1252,10 @@ def _sanity(res):
     """Heuristic sanity verdict for one analysis result. Returns (label, ok)."""
     if res is None:
         return "no-data", False
-    if res.get("pre_profit"):
-        return "pre-profit (deferred)", True  # expected gap, not a failure
     fv = res["dcf"].get("base")
+    pre = res.get("pre_profit")
+    if fv is None and pre:
+        return "pre-profit (no rev)", True  # revenue model couldn't seed; tolerated
     if not fv or fv <= 0:
         return "FV<=0", False
     # Compare to analyst target (preferred) or price, in the same currency.
@@ -1148,8 +1263,13 @@ def _sanity(res):
     if not ref or ref <= 0:
         return "no reference", True
     ratio = fv / ref
-    if 0.4 <= ratio <= 2.5:
-        return f"ok ({ratio:.2f}x)", True
+    # Pre-profit names are a deliberately conservative *floor*: a value well
+    # below the market's optionality-driven price is expected, so only an
+    # implausibly high result is a failure. Profitable names use a tight band.
+    lo = 0.10 if pre else 0.40
+    if lo <= ratio <= 2.5:
+        tag = "floor" if (pre and ratio < 0.4) else "ok"
+        return f"{tag} ({ratio:.2f}x)", True
     return f"OUTLIER ({ratio:.2f}x)", False
 
 def run_validate(tickers, no_cache=True):
@@ -1180,7 +1300,12 @@ def run_validate(tickers, no_cache=True):
                 table.add_row(t.upper(), "-", "-", "-", "-", "-", "-", "-", f"[red]{verdict}[/red]")
                 continue
             cur = res.get("currency") or "USD"
-            method = "Rev→Margin*" if res.get("pre_profit") else ("Residual*" if res.get("base_mode") == "ni" else "FCFE")
+            if res.get("method") == "rev_margin":
+                method = "Rev→Margin"
+            elif res.get("base_mode") == "ni":
+                method = "Residual*"
+            else:
+                method = "FCFE"
             fv = res["dcf"].get("base")
             fv_s = f"{fv:.2f}" if fv is not None else "n/a"
             tgt = res["analyst"].get("target_mean")
@@ -1195,7 +1320,7 @@ def run_validate(tickers, no_cache=True):
                 tgt_s, mos_s, tv_s, f"[{style}]{verdict}[/{style}]",
             )
     console.print(table)
-    console.print("[dim]* method not yet implemented (PR2/PR3) — currently FCFE/flagged.[/dim]")
+    console.print("[dim]* Residual income not yet implemented (PR3) — banks still on FCFE/NI.[/dim]")
     console.print(f"\n[bold]{n_ok}/{n_total} sane[/bold] "
                   f"({'all clear' if n_ok == n_total else 'see OUTLIER/FV<=0 rows'}).")
     return n_ok == n_total
