@@ -595,21 +595,65 @@ def multiples_fair_value(info, sector, fin_ccy, px_ccy):
     pe = MULTIPLE_PE.get(sector, DEFAULT_PE)
     return convert_currency(norm_eps * pe, fin_ccy, px_ccy)
 
-def blended_fair_value(intrinsic, multiples, analyst, tv_pct=None):
-    """Confidence-weighted blend of the intrinsic value, a peer-multiple value,
-    and the analyst target — the headline fair value. An intrinsic estimate that
-    diverges sharply from the multiples/analyst consensus, or that rests mostly
-    on terminal value, is downweighted so a single inflated/deflated/fragile DCF
-    can't drive the headline. Returns (blend, weights_dict)."""
+BLEND_BASE_W = {"intrinsic": 0.45, "analyst": 0.35, "multiples": 0.20}
+
+def data_confidence(info, intrinsic, multiples, analyst, tv_pct=None,
+                    fx_applied=False, pre_profit=False):
+    """Score how trustworthy each valuation leg's *inputs* are. Returns
+    (overall_0_100, grade, factors) where `factors` are 0..1 reliability weights
+    for the intrinsic / analyst / multiples legs of the blend. The headline then
+    leans on whichever legs are actually well-supported by the data."""
+    # Analyst leg: more covering analysts ⇒ more reliable consensus target.
+    n_an = safe_scalar(info.get('numberOfAnalystOpinions'), 0)
+    analyst_f = 0.0 if not analyst or analyst <= 0 else min(1.0, 0.25 + n_an / 20.0)
+
+    # Multiples leg: needs positive EPS; trailing/forward agreement adds trust.
+    te = safe_scalar(info.get('trailingEps'), 0.0)
+    fe = safe_scalar(info.get('forwardEps'), 0.0)
+    pos = [e for e in (te, fe) if e and e > 0]
+    if not multiples or multiples <= 0 or not pos:
+        multiples_f = 0.0
+    elif len(pos) == 2:
+        multiples_f = 0.5 + 0.5 * (min(pos) / max(pos))  # 1.0 when trailing≈forward
+    else:
+        multiples_f = 0.5
+
+    # Intrinsic leg: penalize a fragile terminal value, divergence from the
+    # multiples/analyst consensus, a coarse pre-profit model, and FX conversion.
+    if not intrinsic or intrinsic <= 0:
+        intrinsic_f = 0.0
+    else:
+        intrinsic_f = 1.0
+        others = [v for v in (multiples, analyst) if v and v > 0]
+        if others:
+            ratio = intrinsic / float(np.median(others))
+            if ratio > 2.5 or ratio < 0.4:
+                intrinsic_f *= 0.5
+            elif ratio > 1.75 or ratio < 0.57:
+                intrinsic_f *= 0.75
+        if tv_pct is not None and tv_pct > 0.75:
+            intrinsic_f *= 0.6
+        if pre_profit:
+            intrinsic_f *= 0.7
+        if fx_applied:
+            intrinsic_f *= 0.9
+
+    factors = {"intrinsic": intrinsic_f, "analyst": analyst_f, "multiples": multiples_f}
+    overall = 100.0 * sum(BLEND_BASE_W[k] * factors[k] for k in factors)
+    grade = ("A" if overall >= 80 else "B" if overall >= 65 else
+             "C" if overall >= 50 else "D" if overall >= 35 else "E")
+    return overall, grade, factors
+
+def blended_fair_value(intrinsic, multiples, analyst, factors=None):
+    """Blend the intrinsic value, a peer-multiple value, and the analyst target
+    into the headline fair value. Each leg's base importance is scaled by a
+    0..1 data-confidence `factor`, so unreliable legs (a fragile/divergent DCF,
+    thin analyst coverage, no clean EPS) fade out and can't drive the headline.
+    Returns (blend, weights_dict)."""
     vals = {"intrinsic": intrinsic, "analyst": analyst, "multiples": multiples}
-    base_w = {"intrinsic": 0.45, "analyst": 0.35, "multiples": 0.20}
-    others = [v for k, v in vals.items() if k != "intrinsic" and v and v > 0]
-    if intrinsic and intrinsic > 0 and others:
-        ref = float(np.median(others))
-        ratio = intrinsic / ref if ref > 0 else 1.0
-        if ratio > 2.5 or ratio < 0.4 or (tv_pct is not None and tv_pct > 0.75):
-            base_w["intrinsic"] *= 0.5
-    weights = {k: base_w[k] for k, v in vals.items() if v and v > 0}
+    factors = factors or {k: 1.0 for k in BLEND_BASE_W}
+    weights = {k: BLEND_BASE_W[k] * factors.get(k, 1.0)
+               for k, v in vals.items() if v and v > 0}
     tot = sum(weights.values())
     if tot <= 0:
         return intrinsic, {}
@@ -1008,7 +1052,10 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         # analyst target so float-inflated DCFs (MELI), data glitches (Nintendo)
         # or fragile terminal values don't drive the headline on their own.
         multiples_val = multiples_fair_value(info, sector, fin_ccy, px_ccy)
-        blended_val, blend_weights = blended_fair_value(val_base, multiples_val, t_mean, tv_pct=tv_pct)
+        data_conf, data_grade, conf_factors = data_confidence(
+            info, val_base, multiples_val, t_mean, tv_pct=tv_pct,
+            fx_applied=fx_applied, pre_profit=pre_profit)
+        blended_val, blend_weights = blended_fair_value(val_base, multiples_val, t_mean, factors=conf_factors)
         blended_mos = ((blended_val - current_price) / current_price) * 100 if (blended_val and current_price > 0) else None
 
         # ----- Peer percentiles -----
@@ -1050,6 +1097,9 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             "blended_value": blended_val,
             "blended_weights": blend_weights,
             "blended_mos": blended_mos,
+            "data_confidence": data_conf,
+            "data_grade": data_grade,
+            "conf_factors": conf_factors,
             "mos": mos,
             "confidence": confidence,
             "growth_used": g_start,
@@ -1111,6 +1161,10 @@ def render_dashboard(res):
     blended = res.get('blended_value')
     if blended is not None:
         val_table.add_row("[bold]Blended Fair Value[/bold]", f"[bold gold1]{_money(blended)}[/bold gold1]")
+    if res.get('data_confidence') is not None:
+        dc = res['data_confidence']
+        dc_color = "green" if dc >= 65 else "yellow" if dc >= 50 else "red"
+        val_table.add_row("Data Confidence", f"[{dc_color}]{dc:.0f}/100 ({res.get('data_grade', '-')})[/{dc_color}]")
     bmos = res.get('blended_mos')
     if bmos is not None:
         val_table.add_row("Upside vs Price", f"{bmos:.1f}%" + (" 🟢" if bmos > 20 else " 🟡" if bmos > 0 else " 🔴"))
@@ -1428,6 +1482,7 @@ def run_validate(tickers, no_cache=True):
     table.add_column("Analyst Tgt", justify="right")
     table.add_column("Upside", justify="right")
     table.add_column("TV%", justify="right")
+    table.add_column("Data", justify="right")
     table.add_column("Verdict")
     n_ok = 0
     n_total = 0
@@ -1441,7 +1496,7 @@ def run_validate(tickers, no_cache=True):
             verdict, ok = _sanity(res)
             n_ok += 1 if ok else 0
             if res is None:
-                table.add_row(t.upper(), "-", "-", "-", "-", "-", "-", "-", f"[red]{verdict}[/red]")
+                table.add_row(t.upper(), "-", "-", "-", "-", "-", "-", "-", "-", f"[red]{verdict}[/red]")
                 continue
             cur = res.get("currency") or "USD"
             method = {
@@ -1456,10 +1511,12 @@ def run_validate(tickers, no_cache=True):
             mos_s = f"{mos:+.0f}%" if mos is not None else "n/a"
             tv = res.get("tv_pct")
             tv_s = f"{tv:.0%}" if tv is not None else "-"
+            dc = res.get("data_confidence")
+            dc_s = f"{dc:.0f} ({res.get('data_grade', '-')})" if dc is not None else "-"
             style = "green" if ok else "red"
             table.add_row(
                 res["ticker"], method, cur, fv_s, f"{safe_scalar(res.get('price')):.2f}",
-                tgt_s, mos_s, tv_s, f"[{style}]{verdict}[/{style}]",
+                tgt_s, mos_s, tv_s, dc_s, f"[{style}]{verdict}[/{style}]",
             )
     console.print(table)
 
