@@ -326,13 +326,27 @@ def fcfe_two_stage(base_fcfe, g_start, r, g_term, years=10):
     tv = cfs[-1] * (1 + g_term) / (r - g_term)
     return pv + tv / ((1 + r) ** years)
 
-def normalized_cash_earnings_ps(cashflow, financials, shares):
-    """Per-share base cash flow for the FCFE model: the greater of the 3-yr
-    average FCF and the latest net income. Heavy reinvestment (e.g. AMZN's
-    data-center capex) temporarily depresses reported FCF far below the firm's
-    underlying earnings power, so we don't let one figure dominate."""
+def normalized_cash_earnings_ps(cashflow, financials, shares, mode='auto'):
+    """Per-share base cash flow that the FCFE model grows from. `mode` selects
+    how aggressively to treat reinvestment:
+
+    - 'ni'   : latest net income (most conservative — assumes today's heavy
+               capex persists, so reported FCF stays depressed).
+    - 'fcf'  : 3-yr average free cash flow (OCF + capex).
+    - 'ocf'  : latest operating cash flow (most Simply-Wall-St-like — treats
+               elevated capex as discretionary growth investment that the
+               analysts SWS relies on expect to normalize).
+    - 'auto' : the greater of 3-yr-avg FCF and net income (default; balanced).
+    """
     nfcf, _ = normalized_fcf_per_share(cashflow, shares, years=3)
     ni_ps = find_row(financials, ['Net Income', 'Net Income Continuous Operations'], 0.0) / shares
+    ocf_ps = find_row(cashflow, ['Operating Cash Flow', 'Total Cash From Operating Activities'], 0.0) / shares
+    if mode == 'ni':
+        return ni_ps
+    if mode == 'fcf':
+        return nfcf
+    if mode == 'ocf':
+        return ocf_ps if ocf_ps > 0 else (nfcf or ni_ps)
     candidates = [x for x in (nfcf, ni_ps) if x and x > 0]
     if candidates:
         return max(candidates)
@@ -553,8 +567,8 @@ def compute_confidence(mos, analyst_counts, technical, extra):
     return confidence * 100
 
 # ---------- MAIN ANALYSIS (v12) ----------
-def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
-    cache_key = f"analysis_{ticker_symbol.upper()}"
+def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 'auto'):
+    cache_key = f"analysis_{ticker_symbol.upper()}_{base_mode}"
     if use_cache:
         cached = cache_get(cache_key, expiry_hours=6)
         if cached:
@@ -595,7 +609,7 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
         # ----- 2-stage FCFE valuations (base, bear, bull) -----
         # Base cash flow = normalized cash earnings (greater of 3-yr avg FCF and
         # net income), discounted at cost of equity, à la Simply Wall St.
-        base_fcfe = normalized_cash_earnings_ps(cashflow, financials, shares)
+        base_fcfe = normalized_cash_earnings_ps(cashflow, financials, shares, mode=base_mode)
         val_base = fcfe_two_stage(base_fcfe, g_start, discount, g_term)
         val_bear = fcfe_two_stage(base_fcfe, g_start * 0.6, discount + 0.015, g_term)
         val_bull = fcfe_two_stage(base_fcfe, g_start * 1.25, max(g_term + 0.02, discount - 0.01), g_term)
@@ -669,6 +683,7 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
             "discount_rate": discount,
             "terminal_growth": g_term,
             "base_fcfe": base_fcfe,
+            "base_mode": base_mode,
             "implied_growth": implied_g,
             "mc": {"lower": mc_lower, "median": mc_median, "upper": mc_upper} if mc_lower else None,
             "analyst": {"ratings": dict(analyst_counts), "target_mean": t_mean, "target_median": t_median, "target_high": t_high, "target_low": t_low},
@@ -775,7 +790,8 @@ def render_dashboard(res):
     else:
         rec = "[bold red]STRONG SELL[/bold red] 🔴"
     console.print(Panel(rec, title="Aegis Conviction", border_style="magenta"))
-    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Fair value: ${res['dcf']['base']:.2f}[/dim]")
+    base_lbl = {'ni': 'net income', 'ocf': 'operating cash flow', 'fcf': '3yr-avg FCF', 'auto': 'normalized'}.get(res.get('base_mode', 'auto'), 'normalized')
+    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Base: {base_lbl} (${res.get('base_fcfe', 0):.2f}/sh) | Fair value: ${res['dcf']['base']:.2f}[/dim]")
 
 # ---------- WATCHLIST HELPERS ----------
 def load_watchlist():
@@ -877,7 +893,7 @@ def export_result(res, fmt):
     return None
 
 # ---------- CLI HELPERS (plain functions, callable internally) ----------
-def run_single(ticker, export=None, monte_carlo=False, no_cache=False):
+def run_single(ticker, export=None, monte_carlo=False, no_cache=False, base_mode='auto'):
     """Analyze one ticker and render its dashboard. Returns True on success."""
     if not ticker:
         ticker = Prompt.ask("Ticker", default=load_config()["default_ticker"])
@@ -888,7 +904,7 @@ def run_single(ticker, export=None, monte_carlo=False, no_cache=False):
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                   transient=True) as progress:
         progress.add_task(f"Analyzing {ticker.upper()}...", total=None)
-        res = analyze_ticker(ticker, use_cache=not no_cache)
+        res = analyze_ticker(ticker, use_cache=not no_cache, base_mode=base_mode)
     if not res:
         console.print(f"[red]Could not analyze {ticker.upper()}. Check the symbol and try again.[/red]")
         return False
@@ -950,9 +966,13 @@ def single(
     export: str = typer.Option(None, "--export", "-e", help="Export format: json, csv, excel, pdf"),
     monte_carlo: bool = typer.Option(False, "--monte-carlo", "-m", help="Run Monte Carlo simulation"),
     no_cache: bool = typer.Option(False, "--no-cache", help="Ignore cached results and refetch"),
+    base: str = typer.Option("auto", "--base", "-b", help="FCFE base cash flow: auto, ni, fcf, or ocf (ocf is the most Simply-Wall-St-like)"),
 ):
     """Full valuation dashboard for a single ticker."""
-    if not run_single(ticker, export=export, monte_carlo=monte_carlo, no_cache=no_cache):
+    if base not in ('auto', 'ni', 'fcf', 'ocf'):
+        console.print("[red]--base must be one of: auto, ni, fcf, ocf[/red]")
+        raise typer.Exit(code=1)
+    if not run_single(ticker, export=export, monte_carlo=monte_carlo, no_cache=no_cache, base_mode=base):
         raise typer.Exit(code=1)
 
 @app.command()
