@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "wacc_min": 0.045,
     "wacc_max": 0.15,
     "equity_risk_premium": 0.05,
+    "default_base": "ocf",
     "confidence_weights": {
         "mos": 0.35,
         "analyst": 0.20,
@@ -567,7 +568,9 @@ def compute_confidence(mos, analyst_counts, technical, extra):
     return confidence * 100
 
 # ---------- MAIN ANALYSIS (v12) ----------
-def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 'auto'):
+def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = None):
+    if base_mode is None:
+        base_mode = load_config().get('default_base', 'ocf')
     cache_key = f"analysis_{ticker_symbol.upper()}_{base_mode}"
     if use_cache:
         cached = cache_get(cache_key, expiry_hours=6)
@@ -893,7 +896,7 @@ def export_result(res, fmt):
     return None
 
 # ---------- CLI HELPERS (plain functions, callable internally) ----------
-def run_single(ticker, export=None, monte_carlo=False, no_cache=False, base_mode='auto'):
+def run_single(ticker, export=None, monte_carlo=False, no_cache=False, base_mode=None):
     """Analyze one ticker and render its dashboard. Returns True on success."""
     if not ticker:
         ticker = Prompt.ask("Ticker", default=load_config()["default_ticker"])
@@ -966,10 +969,10 @@ def single(
     export: str = typer.Option(None, "--export", "-e", help="Export format: json, csv, excel, pdf"),
     monte_carlo: bool = typer.Option(False, "--monte-carlo", "-m", help="Run Monte Carlo simulation"),
     no_cache: bool = typer.Option(False, "--no-cache", help="Ignore cached results and refetch"),
-    base: str = typer.Option("auto", "--base", "-b", help="FCFE base cash flow: auto, ni, fcf, or ocf (ocf is the most Simply-Wall-St-like)"),
+    base: str = typer.Option(None, "--base", "-b", help="FCFE base cash flow: auto, ni, fcf, or ocf. Defaults to config 'default_base' (ocf)."),
 ):
     """Full valuation dashboard for a single ticker."""
-    if base not in ('auto', 'ni', 'fcf', 'ocf'):
+    if base is not None and base not in ('auto', 'ni', 'fcf', 'ocf'):
         console.print("[red]--base must be one of: auto, ni, fcf, ocf[/red]")
         raise typer.Exit(code=1)
     if not run_single(ticker, export=export, monte_carlo=monte_carlo, no_cache=no_cache, base_mode=base):
