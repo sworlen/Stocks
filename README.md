@@ -145,6 +145,25 @@ This is what turns the last outliers sane: MercadoLibre's +198% intrinsic blends
 down toward its analyst target, and Nintendo's deflated intrinsic blends up to a
 sensible peer/earnings value. The validation harness reports **13/13 sane**.
 
+#### Data-confidence scoring
+
+The blend weights are not fixed — each leg is scaled by a **0..1 data-confidence
+factor** (`data_confidence`) reflecting how trustworthy *its own inputs* are:
+
+- **intrinsic** — penalized for a fragile terminal value (TV > 75%), divergence
+  from the multiples/analyst consensus (`×0.5` beyond 2.5×/0.4×, `×0.75` beyond
+  1.75×/0.57×), a coarse pre-profit model, and FX conversion.
+- **analyst** — scales with the number of covering analysts
+  (`0.25 + n/20`, capped at 1).
+- **multiples** — needs positive EPS; trailing/forward EPS agreement adds trust.
+
+These factors both **re-weight the blend** (a leg with weak inputs fades out) and
+roll up into an overall **Data Confidence score (0–100, graded A–E)** shown on the
+dashboard and in the harness. In practice clean megacaps/banks grade **A**
+(91–99), names whose DCF diverges from consensus grade **B** (MELI, Nintendo ~75),
+and pre-profit names with no earnings multiple and a coarse model grade **D**
+(OUST, RKLB ~40) — a clear, honest signal of *how much to trust each headline*.
+
 ### Base cash-flow modes (`--base`)
 
 | mode   | base cash flow                                  | notes |
