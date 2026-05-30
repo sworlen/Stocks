@@ -3,7 +3,7 @@
 Aegis Omniscient v12.0 – Professional Stock Valuation Terminal
 - Multi‑stage DCF with smart growth (analyst, historical, sustainable)
 - Implied market growth (reverse DCF)
-- Analyst ratings with fallback scraping
+- Analyst ratings & price targets
 - Monte Carlo simulation (optional)
 - Peer percentile rankings
 - Full export (Excel, PDF, JSON, CSV)
@@ -18,7 +18,6 @@ import json
 import os
 import math
 from datetime import datetime
-from collections import defaultdict
 from functools import lru_cache
 from rich.console import Console
 from rich.table import Table
@@ -40,12 +39,6 @@ try:
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
-try:
-    from bs4 import BeautifulSoup
-    import requests
-    HAS_BS4 = True
-except ImportError:
-    HAS_BS4 = False
 
 app = typer.Typer(help="🧠 Aegis Omniscient v12.0 – Institutional Valuation")
 console = Console()
@@ -411,53 +404,54 @@ def monte_carlo_dcf(base_fcfe, g_start, r, g_term, growth_std=0.03, r_std=0.01, 
         values.append(fcfe_two_stage(base_fcfe, g, rr, g_term))
     return np.percentile(values, [5, 50, 95]), np.std(values)
 
-# ---------- ANALYST RATINGS (Robust with fallback scraping) ----------
+# ---------- ANALYST RATINGS ----------
+def _empty_ratings():
+    return {"strong_buy": 0, "buy": 0, "hold": 0, "sell": 0, "strong_sell": 0}
+
 def get_analyst_ratings(ticker):
+    """Analyst recommendation counts + price targets.
+
+    yfinance's `recommendations` is a DataFrame with columns
+    [period, strongBuy, buy, hold, sell, strongSell], one row per recent month
+    ('0m' = current). We read the latest month. Falls back to the legacy
+    grade-history format, then to `info`'s recommendationKey, if present."""
+    counts = _empty_ratings()
     try:
         rec = ticker.recommendations
-        if rec is None or rec.empty:
-            # Fallback: try to scrape Yahoo Finance summary page
-            if HAS_BS4:
-                url = f"https://finance.yahoo.com/quote/{ticker.ticker}"
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    # Find analyst rating summary (hard but possible)
-                    rating_span = soup.find('span', string=lambda x: x and 'Buy' in x)
-                    if rating_span:
-                        # very rough, just count
-                        pass
-        else:
-            # Combine 'To' and 'Grade' if present
-            if 'To' in rec.columns and 'Grade' in rec.columns:
-                rec['To Grade'] = rec['To'] + " " + rec['Grade']
-                grade_col = 'To Grade'
+        if rec is not None and not rec.empty:
+            cols = {'strongBuy': 'strong_buy', 'buy': 'buy', 'hold': 'hold',
+                    'sell': 'sell', 'strongSell': 'strong_sell'}
+            if set(cols).issubset(rec.columns):
+                # Current-month row (period == '0m'), else the first row.
+                row = rec[rec['period'] == '0m']
+                row = row.iloc[0] if not row.empty else rec.iloc[0]
+                for src, dst in cols.items():
+                    counts[dst] = int(safe_scalar(row[src]))
             else:
-                grade_col = None
-                for col in ['To Grade', 'toGrade', 'Grade', 'Action', 'Rating']:
-                    if col in rec.columns:
-                        grade_col = col
-                        break
-            if grade_col:
-                counts = defaultdict(int)
-                for grade in rec[grade_col].dropna():
-                    g = str(grade).lower()
-                    if 'strong buy' in g or 'strong_buy' in g:
-                        counts['strong_buy'] += 1
-                    elif 'buy' in g and 'strong' not in g:
-                        counts['buy'] += 1
-                    elif 'hold' in g or 'neutral' in g:
-                        counts['hold'] += 1
-                    elif 'sell' in g and 'strong' not in g:
-                        counts['sell'] += 1
-                    elif 'strong sell' in g or 'strong_sell' in g:
-                        counts['strong_sell'] += 1
-                info = ticker.info
-                return counts, info.get('targetMeanPrice'), info.get('targetMedianPrice'), info.get('targetHighPrice'), info.get('targetLowPrice')
+                # Legacy grade-history format.
+                grade_col = next((c for c in ['To Grade', 'toGrade', 'Grade', 'Action', 'Rating'] if c in rec.columns), None)
+                if grade_col:
+                    for grade in rec[grade_col].dropna():
+                        g = str(grade).lower()
+                        if 'strong buy' in g or 'strong_buy' in g:
+                            counts['strong_buy'] += 1
+                        elif 'buy' in g:
+                            counts['buy'] += 1
+                        elif 'hold' in g or 'neutral' in g:
+                            counts['hold'] += 1
+                        elif 'strong sell' in g or 'strong_sell' in g:
+                            counts['strong_sell'] += 1
+                        elif 'sell' in g:
+                            counts['sell'] += 1
     except Exception:
         pass
-    return {"strong_buy":0, "buy":0, "hold":0, "sell":0, "strong_sell":0}, None, None, None, None
+    info = {}
+    try:
+        info = ticker.info
+    except Exception:
+        pass
+    return (counts, info.get('targetMeanPrice'), info.get('targetMedianPrice'),
+            info.get('targetHighPrice'), info.get('targetLowPrice'))
 
 # ---------- PEER PERCENTILE RANKING ----------
 def get_peer_percentiles(ticker_symbol, sector, current_pe, current_ev_ebitda):
@@ -600,9 +594,10 @@ def compute_confidence(mos, analyst_counts, technical, extra):
 
 # ---------- MAIN ANALYSIS (v12) ----------
 def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = None):
-    if base_mode is None:
-        base_mode = load_config().get('default_base', 'ocf')
-    cache_key = f"analysis_{ticker_symbol.upper()}_{base_mode}"
+    # base_mode None => use the configured default, but allow a sector-aware
+    # override below (financials value off net income, not operating cash flow).
+    explicit_base = base_mode is not None
+    cache_key = f"analysis_{ticker_symbol.upper()}_{base_mode or 'default'}"
     if use_cache:
         cached = cache_get(cache_key, expiry_hours=6)
         if cached:
@@ -642,9 +637,17 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         if g_term >= discount:
             g_term = discount - 0.02
 
+        # ----- Resolve the base cash-flow mode (sector-aware) -----
+        # Banks/insurers don't have a meaningful "operating cash flow" (it's
+        # dominated by loan/deposit flows), so unless the user explicitly chose
+        # a base, financials value off net income instead of the OCF default.
+        sector = info.get('sector', 'Technology')
+        if not explicit_base:
+            base_mode = load_config().get('default_base', 'ocf')
+            if sector == 'Financial Services' and base_mode == 'ocf':
+                base_mode = 'ni'
+
         # ----- 2-stage FCFE valuations (base, bear, bull) -----
-        # Base cash flow = normalized cash earnings (greater of 3-yr avg FCF and
-        # net income), discounted at cost of equity, à la Simply Wall St.
         base_fcfe = normalized_cash_earnings_ps(cashflow, financials, shares, mode=base_mode)
         val_base = fcfe_two_stage(base_fcfe, g_start, discount, g_term)
         val_bear = fcfe_two_stage(base_fcfe, g_start * 0.6, discount + 0.015, g_term)
@@ -687,7 +690,6 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
         confidence = compute_confidence(mos, analyst_counts, technical, extra)
 
         # ----- Peer percentiles -----
-        sector = info.get('sector', 'Technology')
         pe = info.get('trailingPE', 0)
         ev_ebitda = info.get('enterpriseToEbitda', 0)
         pe_percentile, ev_percentile = get_peer_percentiles(ticker_symbol, sector, pe, ev_ebitda)
@@ -762,9 +764,19 @@ def render_dashboard(res):
     anal_table.add_column("Metric", style="cyan")
     anal_table.add_column("Value")
     r = res['analyst']['ratings']
-    anal_table.add_row("Ratings", f"SB:{r['strong_buy']} B:{r['buy']} H:{r['hold']} S:{r['sell']} SS:{r['strong_sell']}")
-    if res['analyst']['target_mean']:
-        anal_table.add_row("Target Mean", f"${safe_scalar(res['analyst']['target_mean']):.2f}")
+    total_ratings = sum(r.values())
+    rating_str = f"SB:{r['strong_buy']} B:{r['buy']} H:{r['hold']} S:{r['sell']} SS:{r['strong_sell']}"
+    if total_ratings:
+        rating_str += f"  (n={total_ratings})"
+    anal_table.add_row("Ratings", rating_str)
+    tgt = res['analyst']['target_mean']
+    price = res.get('price', 0)
+    if tgt:
+        line = f"${safe_scalar(tgt):.2f}"
+        if price and price > 0:
+            up = (safe_scalar(tgt) - price) / price * 100
+            line += f"  ({up:+.1f}% vs price)"
+        anal_table.add_row("Analyst Target", line)
     if res['short']['float_pct']:
         anal_table.add_row("Short Float", f"{safe_scalar(res['short']['float_pct']):.1f}%")
     if res['options']['put_call_vol']:

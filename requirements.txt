@@ -5,8 +5,6 @@ numpy>=1.26
 pandas>=2.0
 rich>=13.0
 
-# Optional: export & fallback scraping (the app degrades gracefully if absent)
+# Optional: export formats (the app degrades gracefully if absent)
 openpyxl>=3.1
 fpdf2>=2.7
-beautifulsoup4>=4.12
-requests>=2.31
