@@ -66,6 +66,7 @@ DEFAULT_CONFIG = {
     "min_growth": 0.01,
     "wacc_min": 0.045,
     "wacc_max": 0.15,
+    "equity_risk_premium": 0.05,
     "confidence_weights": {
         "mos": 0.35,
         "analyst": 0.20,
@@ -265,48 +266,103 @@ def estimate_growth(ticker, financials, cashflow, info, shares):
         console.print("[dim]✓ Growth: default 8% (sector average)[/dim]")
     return growth
 
+# ---------- COST OF EQUITY (CAPM) ----------
+def cost_of_equity(beta, rf, erp):
+    """CAPM cost of equity with a Blume-adjusted, bounded beta (the discount
+    rate used by Simply-Wall-St-style FCFE models)."""
+    adj_beta = 0.67 * beta + 0.33          # Blume adjustment toward the market
+    adj_beta = max(0.8, min(2.0, adj_beta))
+    return rf + adj_beta * erp
+
+# ---------- LONG-RUN (TERMINAL) GROWTH ----------
+@lru_cache(maxsize=1)
+def get_longrun_growth():
+    """Perpetual growth rate = 5-year average of the 10-yr Treasury yield
+    (Simply Wall St convention), capped to a sane band."""
+    try:
+        hist = yf.Ticker("^TNX").history(period="5y")['Close']
+        avg = safe_scalar(hist.mean()) / 100
+        if avg > 0:
+            return float(min(0.04, max(0.015, avg)))
+    except Exception:
+        pass
+    return 0.025
+
+# ---------- ANALYST GROWTH SEED ----------
+def analyst_growth_rate(ticker, fallback):
+    """Near-term growth seed from analyst earnings estimates (avg of current &
+    next fiscal year). Falls back to the historical/heuristic estimate."""
+    try:
+        est = ticker.earnings_estimate
+        gs = []
+        for period in ('0y', '+1y'):
+            if period in est.index:
+                g = safe_scalar(est.loc[period, 'growth'])
+                if -0.5 < g < 1.0:
+                    gs.append(g)
+        if gs:
+            return float(np.mean(gs))
+    except Exception:
+        pass
+    return fallback
+
+# ---------- 2-STAGE FCFE DCF (Simply Wall St style) ----------
+def fcfe_two_stage(base_fcfe, g_start, r, g_term, years=10):
+    """2-stage Free-Cash-Flow-to-Equity DCF.
+
+    Projects `years` of levered FCF with the growth rate fading linearly from
+    `g_start` to the long-run rate `g_term`, then a Gordon-Growth terminal
+    value, all discounted at the cost of equity `r`. Returns the equity value
+    in the same units as `base_fcfe` (per-share in, per-share out)."""
+    if base_fcfe <= 0 or r <= g_term:
+        return 0.0
+    cfs = []
+    tmp = base_fcfe
+    for t in range(1, years + 1):
+        g = g_start - (g_start - g_term) * ((t - 1) / (years - 1))
+        tmp *= (1 + g)
+        cfs.append(tmp)
+    pv = sum(c / ((1 + r) ** i) for i, c in enumerate(cfs, 1))
+    tv = cfs[-1] * (1 + g_term) / (r - g_term)
+    return pv + tv / ((1 + r) ** years)
+
+def normalized_cash_earnings_ps(cashflow, financials, shares):
+    """Per-share base cash flow for the FCFE model: the greater of the 3-yr
+    average FCF and the latest net income. Heavy reinvestment (e.g. AMZN's
+    data-center capex) temporarily depresses reported FCF far below the firm's
+    underlying earnings power, so we don't let one figure dominate."""
+    nfcf, _ = normalized_fcf_per_share(cashflow, shares, years=3)
+    ni_ps = find_row(financials, ['Net Income', 'Net Income Continuous Operations'], 0.0) / shares
+    candidates = [x for x in (nfcf, ni_ps) if x and x > 0]
+    if candidates:
+        return max(candidates)
+    return nfcf if nfcf else ni_ps
+
 # ---------- IMPLIED GROWTH (Reverse DCF) ----------
-def implied_growth(current_price, fcf_per_share, wacc, cash_ps, debt_ps, term_g=0.025, max_growth=0.20):
-    """Find growth rate that makes DCF equal current price."""
-    if current_price <= 0 or fcf_per_share <= 0:
+def implied_growth(current_price, base_fcfe, r, g_term, max_growth=0.40):
+    """Solve for the stage-1 growth rate that makes the FCFE DCF equal today's
+    price (what the market is implicitly pricing in)."""
+    if current_price <= 0 or base_fcfe <= 0:
         return None
-    low, high = 0.01, max_growth
-    for _ in range(30):
+    low, high = -0.20, max_growth
+    for _ in range(40):
         mid = (low + high) / 2
-        val = dcf_per_share(fcf_per_share, mid, term_g, wacc, cash_ps, debt_ps)
+        val = fcfe_two_stage(base_fcfe, mid, r, g_term)
         if val > current_price:
             high = mid
         else:
             low = mid
     return (low + high) / 2
 
-# ---------- DCF CORE FUNCTION (reused in compute_dcf and implied) ----------
-def dcf_per_share(fcf_ps, g, tg, w, cash_ps, debt_ps):
-    if fcf_ps <= 0:
-        return 0.0
-    projected = []
-    tmp = fcf_ps
-    for t in range(1, 11):
-        if t <= 5:
-            tmp *= (1 + g)
-        else:
-            fade = g - ((g - tg) * ((t-5)/5))
-            tmp *= (1 + max(tg, fade))
-        projected.append(tmp)
-    pv_fcfs = sum([f / ((1 + w) ** i) for i, f in enumerate(projected, 1)])
-    tv_pv = ((projected[-1] * (1 + tg)) / (w - tg)) / ((1 + w) ** 10)
-    return max(0.0, pv_fcfs + tv_pv + cash_ps - debt_ps)
-
 # ---------- MONTE CARLO DCF ----------
-def monte_carlo_dcf(fcf_ps, growth, wacc, growth_std=0.02, wacc_std=0.005, n_sims=5000):
+def monte_carlo_dcf(base_fcfe, g_start, r, g_term, growth_std=0.03, r_std=0.01, n_sims=5000):
     values = []
-    growths = np.random.normal(growth, growth_std, n_sims)
-    waccs = np.random.normal(wacc, wacc_std, n_sims)
-    for g, w in zip(growths, waccs):
-        g = max(0.01, min(0.20, g))
-        w = max(0.04, min(0.15, w))
-        val = dcf_per_share(fcf_ps, g, 0.025, w, 0, 0)  # cash/debt handled separately
-        values.append(val)
+    growths = np.random.normal(g_start, growth_std, n_sims)
+    rates = np.random.normal(r, r_std, n_sims)
+    for g, rr in zip(growths, rates):
+        g = max(-0.10, min(0.50, g))
+        rr = max(g_term + 0.01, rr)
+        values.append(fcfe_two_stage(base_fcfe, g, rr, g_term))
     return np.percentile(values, [5, 50, 95]), np.std(values)
 
 # ---------- ANALYST RATINGS (Robust with fallback scraping) ----------
@@ -519,52 +575,40 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
         # ----- Fundamental data -----
         # Normalize FCF over several years so a single capex spike doesn't wreck
         # the DCF (e.g. AMZN's data-center buildout collapsed one-year FCF).
-        fcf_per_share, n_years = normalized_fcf_per_share(cashflow, shares, years=3)
-        cash_per_share = info.get('totalCash', 0) / shares
-        debt_per_share = info.get('totalDebt', 0) / shares
+        _, n_years = normalized_fcf_per_share(cashflow, shares, years=3)
         if n_years >= 2:
             console.print(f"[dim]✓ FCF base: {n_years}-yr average (smoothed)[/dim]")
 
-        # If normalized FCF is non-positive/negligible, fall back to net income.
-        if fcf_per_share <= 0.1:
-            net_income = find_row(financials, ['Net Income'], 0.0)
-            fcf_per_share = net_income / shares
-            console.print("[dim]⚠️ FCF low/negative, using net income for DCF.[/dim]")
-
-        # ----- Growth & WACC -----
-        growth = estimate_growth(ticker, financials, cashflow, info, shares)
-        term_g = 0.025
-        beta = max(0.4, info.get('beta', 1.0))
-        rf = get_risk_free_rate()
-        mrp = get_market_risk_premium()
-        cost_equity = rf + beta * mrp
-        interest_exp = find_row(financials, ['Interest Expense'], 0.0)
-        total_debt = info.get('totalDebt', 0)
-        cost_debt = (interest_exp / total_debt) if total_debt > 0 else rf
-        market_cap = shares * current_price
-        total_cap = market_cap + total_debt
-        tax_rate = 0.21
+        # ----- Growth seed & discount rate (cost of equity) -----
         cfg = load_config()
-        wacc = max(cfg['wacc_min'], min(cfg['wacc_max'],
-                     ((market_cap / total_cap) * cost_equity) +
-                     ((total_debt / total_cap) * cost_debt * (1 - tax_rate))))
+        growth = estimate_growth(ticker, financials, cashflow, info, shares)
+        g_start = analyst_growth_rate(ticker, growth)
+        g_start = max(cfg['min_growth'], min(0.30, g_start))
+        rf = get_risk_free_rate()
+        erp = cfg.get('equity_risk_premium', get_market_risk_premium())
+        beta = max(0.4, info.get('beta', 1.0) or 1.0)
+        discount = cost_of_equity(beta, rf, erp)
+        g_term = get_longrun_growth()
+        if g_term >= discount:
+            g_term = discount - 0.02
 
-        # ----- DCF valuations (base, bear, bull) -----
-        val_base = dcf_per_share(fcf_per_share, growth, term_g, wacc, cash_per_share, debt_per_share)
-        val_bear = dcf_per_share(fcf_per_share, growth*0.6, term_g, wacc+0.025, cash_per_share, debt_per_share)
-        val_bull = dcf_per_share(fcf_per_share, growth*1.3, term_g, max(0.04, wacc-0.015), cash_per_share, debt_per_share)
-        # Upside/downside vs. price. Using price as the denominator keeps this
-        # bounded and intuitive; dividing by a tiny intrinsic value (the old
-        # formula) produced nonsensical readings like -3700%.
+        # ----- 2-stage FCFE valuations (base, bear, bull) -----
+        # Base cash flow = normalized cash earnings (greater of 3-yr avg FCF and
+        # net income), discounted at cost of equity, à la Simply Wall St.
+        base_fcfe = normalized_cash_earnings_ps(cashflow, financials, shares)
+        val_base = fcfe_two_stage(base_fcfe, g_start, discount, g_term)
+        val_bear = fcfe_two_stage(base_fcfe, g_start * 0.6, discount + 0.015, g_term)
+        val_bull = fcfe_two_stage(base_fcfe, g_start * 1.25, max(g_term + 0.02, discount - 0.01), g_term)
+        # Upside/downside vs. price (bounded, intuitive).
         mos = ((val_base - current_price) / current_price) * 100 if current_price > 0 else 0
 
-        # ----- Implied growth -----
-        implied_g = implied_growth(current_price, fcf_per_share, wacc, cash_per_share, debt_per_share)
+        # ----- Implied growth (reverse DCF) -----
+        implied_g = implied_growth(current_price, base_fcfe, discount, g_term)
 
         # ----- Monte Carlo (if enabled) -----
         mc_lower = mc_median = mc_upper = None
         if cfg['use_monte_carlo']:
-            percentiles, _ = monte_carlo_dcf(fcf_per_share, growth, wacc, n_sims=cfg['num_simulations'])
+            percentiles, _ = monte_carlo_dcf(base_fcfe, g_start, discount, g_term, n_sims=cfg['num_simulations'])
             mc_lower, mc_median, mc_upper = percentiles
 
         # ----- Analyst & Short, Options -----
@@ -620,8 +664,11 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True):
             "dcf": {"bear": val_bear, "base": val_base, "bull": val_bull},
             "mos": mos,
             "confidence": confidence,
-            "growth_used": growth,
-            "wacc_used": wacc,
+            "growth_used": g_start,
+            "wacc_used": discount,
+            "discount_rate": discount,
+            "terminal_growth": g_term,
+            "base_fcfe": base_fcfe,
             "implied_growth": implied_g,
             "mc": {"lower": mc_lower, "median": mc_median, "upper": mc_upper} if mc_lower else None,
             "analyst": {"ratings": dict(analyst_counts), "target_mean": t_mean, "target_median": t_median, "target_high": t_high, "target_low": t_low},
@@ -728,7 +775,7 @@ def render_dashboard(res):
     else:
         rec = "[bold red]STRONG SELL[/bold red] 🔴"
     console.print(Panel(rec, title="Aegis Conviction", border_style="magenta"))
-    console.print(f"[dim]WACC: {res['wacc_used']:.1%} | Target: ${res['dcf']['base']:.2f}[/dim]")
+    console.print(f"[dim]Discount rate (cost of equity): {res.get('discount_rate', res['wacc_used']):.1%} | Terminal g: {res.get('terminal_growth', 0.025):.1%} | Fair value: ${res['dcf']['base']:.2f}[/dim]")
 
 # ---------- WATCHLIST HELPERS ----------
 def load_watchlist():
@@ -768,7 +815,7 @@ def export_result(res, fmt):
             ("Upside vs Price %", r.get("mos")),
             ("Confidence", r.get("confidence")),
             ("Growth Used", r.get("growth_used")),
-            ("WACC Used", r.get("wacc_used")),
+            ("Discount Rate (CoE)", r.get("discount_rate", r.get("wacc_used"))),
             ("Implied Growth", r.get("implied_growth")),
         ]
 
@@ -949,15 +996,16 @@ def watchlist(no_cache: bool = typer.Option(False, "--no-cache", help="Ignore ca
 @app.command()
 def scenario(
     ticker: str = typer.Argument(..., help="Ticker symbol"),
-    growth: float = typer.Option(..., "--growth", "-g", help="Annual FCF growth rate, e.g. 0.10 for 10%"),
-    wacc: float = typer.Option(0.09, "--wacc", "-w", help="Discount rate (WACC)"),
+    growth: float = typer.Option(..., "--growth", "-g", help="Stage-1 FCFE growth rate, e.g. 0.10 for 10%"),
+    discount: float = typer.Option(0.09, "--discount", "-d", help="Discount rate (cost of equity)"),
     terminal: float = typer.Option(0.025, "--terminal", "-t", help="Terminal growth rate"),
 ):
-    """Custom DCF: supply your own growth, WACC and terminal-growth assumptions."""
+    """Custom 2-stage FCFE DCF: supply your own growth, discount and terminal-growth assumptions."""
     tk = yf.Ticker(ticker)
     try:
         info = tk.info
         cashflow = tk.cashflow
+        financials = tk.financials
     except Exception as e:
         console.print(f"[red]Could not fetch data for {ticker.upper()}: {e}[/red]")
         raise typer.Exit(code=1)
@@ -966,18 +1014,16 @@ def scenario(
     if not shares:
         console.print(f"[red]Missing share count for {ticker.upper()}.[/red]")
         raise typer.Exit(code=1)
-    fcf_per_share, _ = normalized_fcf_per_share(cashflow, shares, years=3)
-    cash_ps = info.get("totalCash", 0) / shares
-    debt_ps = info.get("totalDebt", 0) / shares
-    val = dcf_per_share(fcf_per_share, growth, terminal, wacc, cash_ps, debt_ps)
+    base_fcfe = normalized_cash_earnings_ps(cashflow, financials, shares)
+    val = fcfe_two_stage(base_fcfe, growth, discount, terminal)
     mos = ((val - current_price) / current_price) * 100 if current_price > 0 else 0
-    table = Table(title=f"🎯 Scenario DCF • {ticker.upper()}", box=None)
+    table = Table(title=f"🎯 Scenario FCFE DCF • {ticker.upper()}", box=None)
     table.add_column("Input", style="cyan")
     table.add_column("Value")
-    table.add_row("Growth", f"{growth:.1%}")
-    table.add_row("WACC", f"{wacc:.1%}")
+    table.add_row("Stage-1 Growth", f"{growth:.1%}")
+    table.add_row("Discount (CoE)", f"{discount:.1%}")
     table.add_row("Terminal Growth", f"{terminal:.1%}")
-    table.add_row("FCF / Share", f"${fcf_per_share:.2f}")
+    table.add_row("Base FCFE / Share", f"${base_fcfe:.2f}")
     table.add_row("Current Price", f"${safe_scalar(current_price):.2f}")
     table.add_row("Intrinsic Value", f"[bold gold1]${val:.2f}[/bold gold1]")
     table.add_row("Upside vs Price", f"{mos:.1f}%")
