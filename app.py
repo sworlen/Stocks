@@ -808,31 +808,459 @@ def get_technicals(ticker, period="6mo"):
     return {"sma_50": sma_50, "sma_200": sma_200, "rsi": rsi, "macd_hist": macd_hist, "rel_strength": rel_strength}
 
 # ---------- EXTRA METRICS ----------
+def _safe_pct(numerator, denominator):
+    """Return numerator / denominator, or None when the comparison is unusable."""
+    if denominator is None or denominator == 0:
+        return None
+    return numerator / denominator
+
+def _latest_values(df, row_names, years=4):
+    """Most-recent annual values for a financial statement row (newest first)."""
+    if df is None or df.empty:
+        return []
+    row = None
+    for name in row_names:
+        if name in df.index:
+            row = df.loc[name]
+            break
+    if row is None:
+        for idx in df.index:
+            if any(name.lower() in idx.lower() for name in row_names):
+                row = df.loc[idx]
+                break
+    if row is None:
+        return []
+    vals = []
+    for i in range(min(years, len(row))):
+        vals.append(safe_scalar(row.iloc[i]))
+    return vals
+
+def _growth_from_values(vals):
+    """CAGR from newest-first values; returns None for missing/non-positive data."""
+    vals = [v for v in vals if v and v > 0]
+    if len(vals) < 2:
+        return None
+    periods = len(vals) - 1
+    return (vals[0] / vals[-1]) ** (1 / periods) - 1
+
+def _score_metric(value, good, ok, higher_is_better=True):
+    if value is None:
+        return 0.5
+    if higher_is_better:
+        if value >= good:
+            return 1.0
+        if value >= ok:
+            return 0.7
+        return 0.25
+    if value <= good:
+        return 1.0
+    if value <= ok:
+        return 0.7
+    return 0.25
+
+def piotroski_f_score(info, financials, cashflow, balancesheet):
+    """Nine-point Piotroski F-score using annual statements where available."""
+    ni = _latest_values(financials, ['Net Income', 'Net Income Continuous Operations'], years=2)
+    cfo = _latest_values(cashflow, ['Operating Cash Flow', 'Total Cash From Operating Activities'], years=2)
+    revenue = _latest_values(financials, ['Total Revenue', 'Operating Revenue'], years=2)
+    gross_profit = _latest_values(financials, ['Gross Profit'], years=2)
+    assets = _latest_values(balancesheet, ['Total Assets'], years=2)
+    debt = _latest_values(balancesheet, ['Total Debt', 'Long Term Debt And Capital Lease Obligation', 'Long Term Debt'], years=2)
+    current_assets = _latest_values(balancesheet, ['Current Assets', 'Total Current Assets'], years=2)
+    current_liab = _latest_values(balancesheet, ['Current Liabilities', 'Total Current Liabilities'], years=2)
+    shares_vals = _latest_values(balancesheet, ['Ordinary Shares Number', 'Share Issued'], years=2)
+
+    score = 0
+    checks = 0
+    if ni and assets:
+        score += int(ni[0] > 0); checks += 1
+        if len(ni) > 1 and len(assets) > 1 and assets[0] and assets[1]:
+            roa_now = ni[0] / assets[0]
+            roa_prev = ni[1] / assets[1]
+            score += int(roa_now > roa_prev); checks += 1
+    if cfo:
+        score += int(cfo[0] > 0); checks += 1
+    if cfo and ni:
+        score += int(cfo[0] > ni[0]); checks += 1
+    if len(debt) > 1 and len(assets) > 1 and assets[0] and assets[1]:
+        score += int((debt[0] / assets[0]) < (debt[1] / assets[1])); checks += 1
+    if len(current_assets) > 1 and len(current_liab) > 1 and current_liab[0] and current_liab[1]:
+        score += int((current_assets[0] / current_liab[0]) > (current_assets[1] / current_liab[1])); checks += 1
+    if len(shares_vals) > 1 and shares_vals[0] and shares_vals[1]:
+        score += int(shares_vals[0] <= shares_vals[1]); checks += 1
+    if len(gross_profit) > 1 and len(revenue) > 1 and revenue[0] and revenue[1]:
+        score += int((gross_profit[0] / revenue[0]) > (gross_profit[1] / revenue[1])); checks += 1
+    if len(revenue) > 1 and len(assets) > 1 and assets[0] and assets[1]:
+        score += int((revenue[0] / assets[0]) > (revenue[1] / assets[1])); checks += 1
+
+    # If statements are too sparse, do not imply precision.
+    return score if checks >= 6 else None
+
+def altman_z_score(info, financials, balancesheet):
+    """Altman Z-score for non-financial corporates; returns None for banks/REIT-like data."""
+    sector = info.get('sector')
+    if sector in ('Financial Services', 'Real Estate'):
+        return None
+    assets = find_row(balancesheet, ['Total Assets'], 0.0)
+    if assets <= 0:
+        return None
+    current_assets = find_row(balancesheet, ['Current Assets', 'Total Current Assets'], 0.0)
+    current_liab = find_row(balancesheet, ['Current Liabilities', 'Total Current Liabilities'], 0.0)
+    retained = find_row(balancesheet, ['Retained Earnings'], 0.0)
+    ebit = find_row(financials, ['EBIT', 'Operating Income'], 0.0)
+    revenue = find_row(financials, ['Total Revenue', 'Operating Revenue'], 0.0)
+    liabilities = find_row(balancesheet, ['Total Liabilities Net Minority Interest', 'Total Liab'], 0.0)
+    market_cap = safe_scalar(info.get('marketCap'), 0.0)
+    if liabilities <= 0:
+        return None
+    working_capital = current_assets - current_liab
+    return (1.2 * working_capital / assets + 1.4 * retained / assets +
+            3.3 * ebit / assets + 0.6 * market_cap / liabilities +
+            1.0 * revenue / assets)
+
+def _grade_from_score(score):
+    return ('A' if score >= 80 else 'B' if score >= 65 else
+            'C' if score >= 50 else 'D' if score >= 35 else 'E')
+
+def _metric_display(value, kind='pct_decimal'):
+    if value is None:
+        return None
+    if kind == 'pct_decimal':
+        return f"{safe_scalar(value):.1%}"
+    if kind == 'pct_points':
+        return f"{safe_scalar(value):.1f}%"
+    if kind == 'multiple':
+        return f"{safe_scalar(value):.1f}×"
+    if kind == 'number':
+        return f"{safe_scalar(value):.1f}"
+    if kind == 'money':
+        return f"{safe_scalar(value):.2f}"
+    return str(value)
+
+def _sector_metric(raw, kind='pct_decimal'):
+    return {"value": raw, "display": _metric_display(raw, kind)}
+
+def _mid_band_score(value, low_good, high_good, high_ok):
+    """Score metrics where too little is weak and too much may be wasteful/risky."""
+    if value is None:
+        return 0.5
+    if low_good <= value <= high_good:
+        return 1.0
+    if 0 <= value <= high_ok:
+        return 0.7
+    return 0.25
+
+def sector_specific_scorecard(info, financials, cashflow, balancesheet, metrics, shares, current_price):
+    """Sector-aware diagnostics layered on top of the generic scorecard.
+
+    Generic metrics catch broad business quality, but sectors fail in different
+    ways: banks need book/ROE discipline, REITs need payout/leverage checks,
+    software needs Rule-of-40/SBC context, and cyclicals need margins plus
+    balance-sheet resilience. Returns a display-ready scorecard and flags.
+    """
+    sector = info.get('sector') or 'Unknown'
+    revenue = find_row(financials, ['Total Revenue', 'Operating Revenue'], 0.0)
+    cogs = abs(find_row(financials, ['Cost Of Revenue', 'Cost Of Goods Sold'], 0.0))
+    rd = abs(find_row(financials, ['Research And Development', 'Research Development'], 0.0))
+    sbc = abs(find_row(cashflow, ['Stock Based Compensation', 'StockBasedCompensation',
+                                  'Stock Based Compensation Expense'], 0.0))
+    cfo = find_row(cashflow, ['Operating Cash Flow', 'Total Cash From Operating Activities'], 0.0)
+    capex = find_row(cashflow, ['Capital Expenditure', 'Capital Expenditures'], 0.0)
+    fcf_abs = cfo + capex
+    dividends = abs(find_row(cashflow, ['Dividends Paid', 'Common Stock Dividends'], 0.0))
+    inventory = find_row(balancesheet, ['Inventory'], 0.0)
+    assets = find_row(balancesheet, ['Total Assets'], 0.0)
+    equity = find_row(balancesheet, ['Total Equity Gross Minority Interest', 'Stockholders Equity', 'Total Equity'], 0.0)
+    debt = safe_scalar(info.get('totalDebt'), 0.0) or find_row(balancesheet, ['Total Debt'], 0.0)
+    cash = safe_scalar(info.get('totalCash'), 0.0) or find_row(balancesheet, ['Cash And Cash Equivalents', 'Cash Cash Equivalents And Short Term Investments'], 0.0)
+    market_cap = safe_scalar(info.get('marketCap'), 0.0) or (current_price * shares if current_price and shares else 0.0)
+    ev_ebitda = safe_scalar(info.get('enterpriseToEbitda'), 0.0) or None
+    price_to_book = safe_scalar(info.get('priceToBook'), 0.0) or None
+    payout_raw = info.get('payoutRatio')
+    payout_ratio = safe_scalar(payout_raw) if payout_raw is not None else None
+
+    rd_intensity = _safe_pct(rd, revenue) if revenue > 0 and rd > 0 else None
+    sbc_intensity = _safe_pct(sbc, revenue) if revenue > 0 and sbc > 0 else None
+    inventory_turnover = _safe_pct(cogs, inventory) if cogs > 0 and inventory > 0 else None
+    debt_to_assets = _safe_pct(debt, assets) if assets > 0 else None
+    equity_to_assets = _safe_pct(equity, assets) if assets > 0 else None
+    net_cash_to_market_cap = _safe_pct(cash - debt, market_cap) if market_cap > 0 else None
+    fcf_payout = _safe_pct(dividends, fcf_abs) if fcf_abs > 0 and dividends > 0 else None
+    roe_to_pb = _safe_pct(metrics.get('roe'), price_to_book) if price_to_book and price_to_book > 0 else None
+
+    entries = {}
+    scores = {}
+    flags = []
+
+    def add(label, value, kind, score=None):
+        if value is None:
+            return
+        entries[label] = _sector_metric(value, kind)
+        if score is not None:
+            scores[label] = score
+
+    if sector in ('Technology', 'Communication Services'):
+        add('Rule of 40', metrics.get('rule_of_40'), 'pct_points',
+            _score_metric(metrics.get('rule_of_40'), 40.0, 20.0))
+        add('Gross Margin', metrics.get('gross_margin'), 'pct_decimal',
+            _score_metric(metrics.get('gross_margin'), 0.60, 0.35))
+        add('R&D / Revenue', rd_intensity, 'pct_decimal',
+            _mid_band_score(rd_intensity, 0.05, 0.25, 0.40))
+        add('SBC / Revenue', sbc_intensity, 'pct_decimal',
+            _score_metric(sbc_intensity, 0.05, 0.12, higher_is_better=False))
+        add('Net Cash / Mkt Cap', net_cash_to_market_cap, 'pct_decimal',
+            _score_metric(net_cash_to_market_cap, 0.05, -0.05))
+        if sbc_intensity is not None and sbc_intensity > 0.12:
+            flags.append(f"sector: high SBC burden ({sbc_intensity:.1%} of revenue)")
+    elif sector == 'Financial Services':
+        add('ROE', metrics.get('roe'), 'pct_decimal',
+            _score_metric(metrics.get('roe'), 0.15, 0.10))
+        add('P/B', price_to_book, 'multiple',
+            _score_metric(price_to_book, 1.2, 2.0, higher_is_better=False))
+        add('ROE / P/B', roe_to_pb, 'pct_decimal',
+            _score_metric(roe_to_pb, 0.08, 0.05))
+        add('Equity / Assets', equity_to_assets, 'pct_decimal',
+            _score_metric(equity_to_assets, 0.08, 0.05))
+        add('Dividend Yield', metrics.get('dividend_yield'), 'pct_points',
+            _score_metric(metrics.get('dividend_yield'), 3.0, 1.5))
+        if equity_to_assets is not None and equity_to_assets < 0.05:
+            flags.append(f"sector: thin equity/assets ({equity_to_assets:.1%})")
+    elif sector == 'Real Estate':
+        add('Debt / Assets', debt_to_assets, 'pct_decimal',
+            _score_metric(debt_to_assets, 0.45, 0.60, higher_is_better=False))
+        add('FCF Payout', fcf_payout, 'pct_decimal',
+            _score_metric(fcf_payout, 0.80, 1.00, higher_is_better=False))
+        add('Dividend Yield', metrics.get('dividend_yield'), 'pct_points',
+            _score_metric(metrics.get('dividend_yield'), 4.0, 2.0))
+        add('P/B', price_to_book, 'multiple',
+            _score_metric(price_to_book, 1.5, 2.5, higher_is_better=False))
+        add('FCF Yield', metrics.get('fcf_yield'), 'pct_points',
+            _score_metric(metrics.get('fcf_yield'), 5.0, 3.0))
+        if fcf_payout is not None and fcf_payout > 1.0:
+            flags.append(f"sector: dividend exceeds FCF ({fcf_payout:.0%} payout)")
+    elif sector in ('Energy', 'Basic Materials'):
+        add('EV/EBITDA', ev_ebitda, 'multiple',
+            _score_metric(ev_ebitda, 6.0, 10.0, higher_is_better=False))
+        add('Net Debt/EBITDA', metrics.get('net_debt_to_ebitda'), 'multiple',
+            _score_metric(metrics.get('net_debt_to_ebitda'), 1.0, 2.5, higher_is_better=False))
+        add('FCF Yield', metrics.get('fcf_yield'), 'pct_points',
+            _score_metric(metrics.get('fcf_yield'), 8.0, 4.0))
+        add('Shareholder Yield', metrics.get('total_shareholder_yield'), 'pct_points',
+            _score_metric(metrics.get('total_shareholder_yield'), 5.0, 2.0))
+        add('Operating Margin', metrics.get('operating_margin'), 'pct_decimal',
+            _score_metric(metrics.get('operating_margin'), 0.18, 0.08))
+    elif sector == 'Healthcare':
+        add('Gross Margin', metrics.get('gross_margin'), 'pct_decimal',
+            _score_metric(metrics.get('gross_margin'), 0.65, 0.40))
+        add('R&D / Revenue', rd_intensity, 'pct_decimal',
+            _mid_band_score(rd_intensity, 0.08, 0.25, 0.45))
+        add('Revenue CAGR', metrics.get('revenue_cagr_3y'), 'pct_decimal',
+            _score_metric(metrics.get('revenue_cagr_3y'), 0.08, 0.02))
+        add('FCF Conversion', metrics.get('fcf_conversion'), 'pct_decimal',
+            _score_metric(metrics.get('fcf_conversion'), 0.80, 0.50))
+        add('Net Cash / Mkt Cap', net_cash_to_market_cap, 'pct_decimal',
+            _score_metric(net_cash_to_market_cap, 0.03, -0.10))
+    elif sector in ('Consumer Cyclical', 'Consumer Defensive'):
+        add('Gross Margin', metrics.get('gross_margin'), 'pct_decimal',
+            _score_metric(metrics.get('gross_margin'), 0.35, 0.20))
+        add('Operating Margin', metrics.get('operating_margin'), 'pct_decimal',
+            _score_metric(metrics.get('operating_margin'), 0.12, 0.06))
+        add('Inventory Turnover', inventory_turnover, 'multiple',
+            _score_metric(inventory_turnover, 6.0, 3.0))
+        add('Revenue CAGR', metrics.get('revenue_cagr_3y'), 'pct_decimal',
+            _score_metric(metrics.get('revenue_cagr_3y'), 0.06, 0.02))
+        add('FCF Conversion', metrics.get('fcf_conversion'), 'pct_decimal',
+            _score_metric(metrics.get('fcf_conversion'), 0.80, 0.50))
+    elif sector == 'Utilities':
+        add('Dividend Yield', metrics.get('dividend_yield'), 'pct_points',
+            _score_metric(metrics.get('dividend_yield'), 3.5, 2.0))
+        add('Payout Ratio', payout_ratio, 'pct_decimal',
+            _score_metric(payout_ratio, 0.75, 0.90, higher_is_better=False))
+        add('Net Debt/EBITDA', metrics.get('net_debt_to_ebitda'), 'multiple',
+            _score_metric(metrics.get('net_debt_to_ebitda'), 4.0, 5.5, higher_is_better=False))
+        add('Interest Coverage', metrics.get('interest_coverage'), 'multiple',
+            _score_metric(metrics.get('interest_coverage'), 4.0, 2.5))
+        add('FCF Yield', metrics.get('fcf_yield'), 'pct_points',
+            _score_metric(metrics.get('fcf_yield'), 4.0, 1.5))
+    else:
+        add('ROIC', metrics.get('roic'), 'pct_decimal',
+            _score_metric(metrics.get('roic'), 0.12, 0.06))
+        add('Operating Margin', metrics.get('operating_margin'), 'pct_decimal',
+            _score_metric(metrics.get('operating_margin'), 0.12, 0.06))
+        add('FCF Conversion', metrics.get('fcf_conversion'), 'pct_decimal',
+            _score_metric(metrics.get('fcf_conversion'), 0.80, 0.50))
+        add('Net Debt/EBITDA', metrics.get('net_debt_to_ebitda'), 'multiple',
+            _score_metric(metrics.get('net_debt_to_ebitda'), 2.0, 3.0, higher_is_better=False))
+        add('Revenue CAGR', metrics.get('revenue_cagr_3y'), 'pct_decimal',
+            _score_metric(metrics.get('revenue_cagr_3y'), 0.08, 0.02))
+
+    score = sum(scores.values()) / len(scores) * 100 if scores else None
+    grade = _grade_from_score(score) if score is not None else None
+    if score is not None and score < 45:
+        flags.append(f"sector: weak {sector} score ({score:.0f}/100)")
+    return {"sector": sector, "score": score, "grade": grade,
+            "metrics": entries, "components": scores, "flags": flags}
+
+def trend_scorecard(financials, cashflow, balancesheet, metrics):
+    """Multi-year trend diagnostics so a snapshot score does not hide decay.
+
+    Uses newest-first annual statements. The goal is not to forecast precisely;
+    it is to flag whether revenue, margins, FCF, dilution, and leverage are
+    moving in the right direction over the available history.
+    """
+    revenue_vals = _latest_values(financials, ['Total Revenue', 'Operating Revenue'], years=4)
+    gross_profit_vals = _latest_values(financials, ['Gross Profit'], years=4)
+    ebit_vals = _latest_values(financials, ['EBIT', 'Operating Income'], years=4)
+    cfo_vals = _latest_values(cashflow, ['Operating Cash Flow', 'Total Cash From Operating Activities'], years=4)
+    capex_vals = _latest_values(cashflow, ['Capital Expenditure', 'Capital Expenditures'], years=4)
+    debt_vals = _latest_values(balancesheet, ['Total Debt', 'Long Term Debt And Capital Lease Obligation', 'Long Term Debt'], years=4)
+    shares_vals = _latest_values(balancesheet, ['Ordinary Shares Number', 'Share Issued'], years=4)
+
+    def ratio_series(nums, dens):
+        vals = []
+        for n, d in zip(nums, dens):
+            vals.append(_safe_pct(n, d) if d else None)
+        return vals
+
+    def point_change(vals):
+        vals = [v for v in vals if v is not None]
+        return vals[0] - vals[-1] if len(vals) >= 2 else None
+
+    def cagr(vals):
+        return _growth_from_values(vals)
+
+    gross_margin_change = point_change(ratio_series(gross_profit_vals, revenue_vals))
+    operating_margin_change = point_change(ratio_series(ebit_vals, revenue_vals))
+    fcf_vals = [c + capex_vals[i] if i < len(capex_vals) else c for i, c in enumerate(cfo_vals)]
+    fcf_margin_change = point_change(ratio_series(fcf_vals, revenue_vals))
+    revenue_cagr = cagr(revenue_vals)
+    debt_cagr = cagr(debt_vals)
+    share_cagr = cagr(shares_vals)
+
+    entries = {}
+    scores = {}
+    flags = []
+
+    def add(label, value, kind, score=None):
+        if value is None:
+            return
+        entries[label] = _sector_metric(value, kind)
+        if score is not None:
+            scores[label] = score
+
+    add('Revenue CAGR', revenue_cagr, 'pct_decimal', _score_metric(revenue_cagr, 0.10, 0.03))
+    add('Gross Margin Δ', gross_margin_change, 'pct_decimal', _score_metric(gross_margin_change, 0.02, -0.02))
+    add('Operating Margin Δ', operating_margin_change, 'pct_decimal', _score_metric(operating_margin_change, 0.02, -0.02))
+    add('FCF Margin Δ', fcf_margin_change, 'pct_decimal', _score_metric(fcf_margin_change, 0.02, -0.02))
+    add('Share Count CAGR', share_cagr, 'pct_decimal', _score_metric(share_cagr, 0.00, 0.03, higher_is_better=False))
+    if debt_cagr is not None:
+        # Debt can grow with the business; penalize it when it outruns revenue by a lot.
+        debt_score = 1.0 if debt_cagr <= 0 else 0.7 if revenue_cagr is not None and debt_cagr <= revenue_cagr + 0.03 else 0.25
+        add('Debt CAGR', debt_cagr, 'pct_decimal', debt_score)
+    if metrics.get('earnings_cagr_3y') is not None:
+        add('Earnings CAGR', metrics.get('earnings_cagr_3y'), 'pct_decimal',
+            _score_metric(metrics.get('earnings_cagr_3y'), 0.10, 0.00))
+
+    if share_cagr is not None and share_cagr > 0.05:
+        flags.append(f"trend: share count growing {share_cagr:.1%}/yr (dilution)")
+    if operating_margin_change is not None and operating_margin_change < -0.05:
+        flags.append(f"trend: operating margin down {abs(operating_margin_change):.1%} over history")
+    if fcf_margin_change is not None and fcf_margin_change < -0.05:
+        flags.append(f"trend: FCF margin down {abs(fcf_margin_change):.1%} over history")
+    if debt_cagr is not None and revenue_cagr is not None and debt_cagr > revenue_cagr + 0.10:
+        flags.append(f"trend: debt growth ({debt_cagr:.1%}/yr) outpacing revenue ({revenue_cagr:.1%}/yr)")
+
+    score = sum(scores.values()) / len(scores) * 100 if scores else None
+    grade = _grade_from_score(score) if score is not None else None
+    if score is not None and score < 45:
+        flags.append(f"trend: weak multi-year trend score ({score:.0f}/100)")
+    return {"score": score, "grade": grade, "metrics": entries,
+            "components": scores, "flags": flags}
+
 def get_extra_metrics(ticker, info, financials, cashflow, balancesheet, shares, current_price):
     metrics = {}
     try:
-        cfo = safe_scalar(cashflow.loc['Operating Cash Flow'].iloc[0]) if 'Operating Cash Flow' in cashflow.index else 0
-        net_income = safe_scalar(financials.loc['Net Income'].iloc[0]) if 'Net Income' in financials.index else 0
+        cfo = find_row(cashflow, ['Operating Cash Flow', 'Total Cash From Operating Activities'], 0.0)
+        capex = find_row(cashflow, ['Capital Expenditure', 'Capital Expenditures'], 0.0)
+        fcf_abs = cfo + capex
+        net_income = find_row(financials, ['Net Income', 'Net Income Continuous Operations'], 0.0)
+        revenue = find_row(financials, ['Total Revenue', 'Operating Revenue'], 0.0)
+        gross_profit = find_row(financials, ['Gross Profit'], 0.0)
+        ebit = find_row(financials, ['EBIT', 'Operating Income'], 0.0)
+        ebitda = safe_scalar(info.get('ebitda'), 0.0) or find_row(financials, ['EBITDA'], 0.0)
+        interest_expense = abs(find_row(financials, ['Interest Expense', 'Interest Expense Non Operating'], 0.0))
+        total_equity = find_row(balancesheet, ['Total Equity Gross Minority Interest', 'Stockholders Equity', 'Total Equity'], 0.0)
+        total_assets = find_row(balancesheet, ['Total Assets'], 0.0)
+        current_assets = find_row(balancesheet, ['Current Assets', 'Total Current Assets'], 0.0)
+        current_liab = find_row(balancesheet, ['Current Liabilities', 'Total Current Liabilities'], 0.0)
+        total_debt = safe_scalar(info.get('totalDebt'), 0.0) or find_row(balancesheet, ['Total Debt'], 0.0)
+        cash = safe_scalar(info.get('totalCash'), 0.0) or find_row(balancesheet, ['Cash And Cash Equivalents', 'Cash Cash Equivalents And Short Term Investments'], 0.0)
+        invested_capital = total_debt + total_equity - cash
+
         if net_income != 0:
             metrics['earnings_quality'] = cfo / net_income if cfo != 0 else None
-        total_equity = safe_scalar(balancesheet.loc['Total Equity Gross Minority Interest'].iloc[0]) if 'Total Equity Gross Minority Interest' in balancesheet.index else 1
         if total_equity != 0 and net_income != 0:
             roe = net_income / total_equity
-            dividends = safe_scalar(cashflow.loc['Dividends Paid'].iloc[0]) if 'Dividends Paid' in cashflow.index else 0
+            dividends = find_row(cashflow, ['Dividends Paid', 'Common Stock Dividends'], 0.0)
             payout = dividends / net_income if net_income != 0 else 0
             sustainable = roe * (1 - payout)
+            metrics['roe'] = roe
             metrics['sustainable_growth'] = min(0.20, sustainable) if sustainable > 0 else None
+        metrics['roic'] = _safe_pct(ebit * (1 - 0.21), invested_capital) if invested_capital > 0 else None
+        metrics['gross_margin'] = _safe_pct(gross_profit, revenue)
+        metrics['operating_margin'] = _safe_pct(ebit, revenue)
+        metrics['net_margin'] = _safe_pct(net_income, revenue)
+        metrics['fcf_margin'] = _safe_pct(fcf_abs, revenue)
+        metrics['fcf_conversion'] = _safe_pct(fcf_abs, net_income) if net_income > 0 else None
+        metrics['current_ratio'] = _safe_pct(current_assets, current_liab)
+        metrics['debt_to_equity'] = _safe_pct(total_debt, total_equity) if total_equity > 0 else None
+        metrics['net_debt_to_ebitda'] = _safe_pct(total_debt - cash, ebitda) if ebitda > 0 else None
+        metrics['interest_coverage'] = _safe_pct(ebit, interest_expense) if interest_expense > 0 else None
+        metrics['revenue_cagr_3y'] = _growth_from_values(_latest_values(financials, ['Total Revenue', 'Operating Revenue'], years=4))
+        metrics['earnings_cagr_3y'] = _growth_from_values(_latest_values(financials, ['Net Income', 'Net Income Continuous Operations'], years=4))
+        metrics['rule_of_40'] = None
+        if metrics.get('revenue_cagr_3y') is not None and metrics.get('fcf_margin') is not None:
+            metrics['rule_of_40'] = (metrics['revenue_cagr_3y'] + metrics['fcf_margin']) * 100
+        peg = info.get('pegRatio')
+        metrics['peg_ratio'] = safe_scalar(peg) if peg else None
+        metrics['piotroski'] = piotroski_f_score(info, financials, cashflow, balancesheet)
+        metrics['altman_z'] = altman_z_score(info, financials, balancesheet)
+
         shares_begin = info.get('sharesOutstanding', shares)
         buyback_yield = ((shares_begin - shares) / shares_begin) if shares_begin else 0
         metrics['buyback_yield'] = max(0, buyback_yield) * 100
         div_yield = info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 0
         metrics['dividend_yield'] = div_yield
         metrics['total_shareholder_yield'] = div_yield + metrics['buyback_yield']
-        fcf_abs = cfo + (safe_scalar(cashflow.loc['Capital Expenditure'].iloc[0]) if 'Capital Expenditure' in cashflow.index else 0)
         metrics['fcf_yield'] = (fcf_abs / (current_price * shares)) * 100 if current_price and shares else None
+
+        quality_inputs = {
+            'Profitability': _score_metric(metrics.get('roic'), 0.12, 0.06),
+            'Cash conversion': _score_metric(metrics.get('fcf_conversion'), 0.90, 0.60),
+            'Balance sheet': _score_metric(metrics.get('net_debt_to_ebitda'), 1.5, 3.0, higher_is_better=False),
+            'Growth': _score_metric(metrics.get('revenue_cagr_3y'), 0.10, 0.03),
+            'Valuation sanity': _score_metric(metrics.get('fcf_yield'), 5.0, 2.0),
+        }
+        metrics['fundamental_score'] = sum(quality_inputs.values()) / len(quality_inputs) * 100
+        metrics['fundamental_grade'] = ('A' if metrics['fundamental_score'] >= 80 else
+                                        'B' if metrics['fundamental_score'] >= 65 else
+                                        'C' if metrics['fundamental_score'] >= 50 else
+                                        'D' if metrics['fundamental_score'] >= 35 else 'E')
+        metrics['fundamental_components'] = quality_inputs
+        sector_card = sector_specific_scorecard(info, financials, cashflow, balancesheet, metrics, shares, current_price)
+        trend_card = trend_scorecard(financials, cashflow, balancesheet, metrics)
+        metrics['sector_scorecard'] = sector_card
+        metrics['trend_scorecard'] = trend_card
+        blended_score = metrics['fundamental_score']
+        if sector_card.get('score') is not None:
+            blended_score = blended_score * 0.70 + sector_card['score'] * 0.30
+        if trend_card.get('score') is not None:
+            blended_score = blended_score * 0.80 + trend_card['score'] * 0.20
+        metrics['fundamental_score'] = blended_score
+        metrics['fundamental_grade'] = _grade_from_score(blended_score)
         return metrics
     except Exception:
-        return {}
+        return metrics
 
 # ---------- CONFIDENCE SCORE ----------
 def compute_confidence(mos, analyst_counts, technical, extra):
@@ -870,6 +1298,11 @@ def compute_confidence(mos, analyst_counts, technical, extra):
             qual_score += 0.15
         if extra.get('total_shareholder_yield', 0) > 3:
             qual_score += 0.15
+        fs = extra.get('fundamental_score')
+        if fs is not None:
+            # Let the deeper fundamental scorecard nudge quality up/down rather
+            # than relying only on earnings quality and yield.
+            qual_score = 0.65 * qual_score + 0.35 * max(0, min(1, fs / 100))
         qual_norm = min(1, qual_score)
     else:
         qual_norm = 0.5
@@ -1042,9 +1475,9 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             put_call_vol = None
 
         # ----- Quality & Technicals -----
-        piotroski = None  # simplified, left as previous
         technical = get_technicals(ticker, period="1y")
         extra = get_extra_metrics(ticker, info, financials, cashflow, balancesheet, shares, current_price)
+        piotroski = extra.get('piotroski')
         confidence = compute_confidence(mos if mos is not None else 0.0, analyst_counts, technical, extra)
 
         # ----- Multiples cross-check + blended (headline) fair value -----
@@ -1069,6 +1502,18 @@ def analyze_ticker(ticker_symbol: str, use_cache: bool = True, base_mode: str = 
             flags.append("⚠️ Low earnings quality (CFO < NI)")
         if extra.get('fcf_yield') and extra['fcf_yield'] < 2:
             flags.append("⚠️ Low FCF yield (<2%)")
+        if extra.get('fundamental_score') is not None and extra['fundamental_score'] < 45:
+            flags.append(f"🧾 Weak fundamental score ({extra['fundamental_score']:.0f}/100)")
+        if extra.get('piotroski') is not None and extra['piotroski'] <= 3:
+            flags.append(f"🧮 Low Piotroski F-score ({extra['piotroski']}/9)")
+        if extra.get('altman_z') is not None and extra['altman_z'] < 1.8:
+            flags.append(f"🏚️ Altman Z-score distress zone ({extra['altman_z']:.1f})")
+        if extra.get('net_debt_to_ebitda') is not None and extra['net_debt_to_ebitda'] > 3.5:
+            flags.append(f"🏦 Elevated leverage ({extra['net_debt_to_ebitda']:.1f}× net debt/EBITDA)")
+        for flag in extra.get('sector_scorecard', {}).get('flags', []):
+            flags.append(f"🏷️ {flag}")
+        for flag in extra.get('trend_scorecard', {}).get('flags', []):
+            flags.append(f"📉 {flag}")
         if short_float and short_float > 20:
             flags.append("📉 High short interest >20%")
         if pre_profit:
@@ -1201,19 +1646,57 @@ def render_dashboard(res):
     anal_table.add_row("EV/EBITDA vs Peers", f"{res['peer_percentiles']['ev_ebitda']:.0f}th percentile")
 
     # Quality & Efficiency
-    qual_table = Table(title="🧪 Quality", box=None)
+    qual_table = Table(title="🧪 Fundamentals", box=None)
     qual_table.add_column("Metric", style="cyan")
     qual_table.add_column("Value")
-    eq = res['extra'].get('earnings_quality')
+    extra = res['extra']
+
+    def _pct(v):
+        return f"{safe_scalar(v):.1%}" if v is not None else "[dim]n/a[/dim]"
+
+    def _x(v):
+        return f"{safe_scalar(v):.1f}×" if v is not None else "[dim]n/a[/dim]"
+
+    fs = extra.get('fundamental_score')
+    if fs is not None:
+        color = "green" if fs >= 65 else "yellow" if fs >= 50 else "red"
+        qual_table.add_row("Fundamental Score", f"[{color}]{fs:.0f}/100 ({extra.get('fundamental_grade', '-')})[/{color}]")
+    sector_card = extra.get('sector_scorecard') or {}
+    if sector_card.get('score') is not None:
+        sc = sector_card['score']
+        sc_color = "green" if sc >= 65 else "yellow" if sc >= 50 else "red"
+        sector_name = sector_card.get('sector', 'Sector')
+        qual_table.add_row(f"{sector_name} Score", f"[{sc_color}]{sc:.0f}/100 ({sector_card.get('grade', '-')})[/{sc_color}]")
+        for label, item in list((sector_card.get('metrics') or {}).items())[:5]:
+            qual_table.add_row(f"• {label}", item.get('display', '[dim]n/a[/dim]'))
+    trend_card = extra.get('trend_scorecard') or {}
+    if trend_card.get('score') is not None:
+        ts = trend_card['score']
+        ts_color = "green" if ts >= 65 else "yellow" if ts >= 50 else "red"
+        qual_table.add_row("Trend Score", f"[{ts_color}]{ts:.0f}/100 ({trend_card.get('grade', '-')})[/{ts_color}]")
+        for label, item in list((trend_card.get('metrics') or {}).items())[:4]:
+            qual_table.add_row(f"↳ {label}", item.get('display', '[dim]n/a[/dim]'))
+    if extra.get('piotroski') is not None:
+        qual_table.add_row("Piotroski F", f"{extra['piotroski']}/9")
+    if extra.get('altman_z') is not None:
+        qual_table.add_row("Altman Z", f"{extra['altman_z']:.1f}")
+    if extra.get('roic') is not None:
+        qual_table.add_row("ROIC", _pct(extra.get('roic')))
+    if extra.get('revenue_cagr_3y') is not None:
+        qual_table.add_row("Revenue CAGR", _pct(extra.get('revenue_cagr_3y')))
+    if extra.get('fcf_margin') is not None:
+        qual_table.add_row("FCF Margin", _pct(extra.get('fcf_margin')))
+    if extra.get('net_debt_to_ebitda') is not None:
+        qual_table.add_row("Net Debt/EBITDA", _x(extra.get('net_debt_to_ebitda')))
+    if extra.get('current_ratio') is not None:
+        qual_table.add_row("Current Ratio", _x(extra.get('current_ratio')))
+    eq = extra.get('earnings_quality')
     if eq:
         qual_table.add_row("Earnings Quality", f"{eq:.2f}")
-    sg = res['extra'].get('sustainable_growth')
-    if sg:
-        qual_table.add_row("Sustainable Growth", f"{sg:.1%}")
-    if res['extra'].get('total_shareholder_yield'):
-        qual_table.add_row("Total Yield", f"{res['extra']['total_shareholder_yield']:.1f}%")
-    if res['extra'].get('fcf_yield'):
-        qual_table.add_row("FCF Yield", f"{res['extra']['fcf_yield']:.1f}%")
+    if extra.get('total_shareholder_yield'):
+        qual_table.add_row("Total Yield", f"{extra['total_shareholder_yield']:.1f}%")
+    if extra.get('fcf_yield'):
+        qual_table.add_row("FCF Yield", f"{extra['fcf_yield']:.1f}%")
     if res['growth_used']:
         qual_table.add_row("Assumed Growth", f"{res['growth_used']:.1%}")
     if res['implied_growth']:

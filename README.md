@@ -164,6 +164,51 @@ dashboard and in the harness. In practice clean megacaps/banks grade **A**
 and pre-profit names with no earnings multiple and a coarse model grade **D**
 (OUST, RKLB ~40) — a clear, honest signal of *how much to trust each headline*.
 
+### Fundamental scorecard
+
+The dashboard now evaluates whether a stock is *good enough to underwrite*, not
+just whether the DCF says it is cheap. The **Fundamentals** panel adds a 0–100
+score and grade built from five checks:
+
+| check | what it looks for |
+|-------|-------------------|
+| Profitability | ROIC above the cost of capital hurdle |
+| Cash conversion | free cash flow converting cleanly from earnings |
+| Balance sheet | net debt / EBITDA staying manageable |
+| Growth | 3-year revenue CAGR that supports the valuation story |
+| Valuation sanity | FCF yield high enough to avoid overpaying for quality |
+
+It also surfaces missing-but-important diagnostics: **Piotroski F-score**,
+**Altman Z-score**, ROIC, revenue CAGR, FCF margin, current ratio, and leverage.
+Weak scorecard readings create explicit risk flags (low Piotroski, distress-zone
+Altman Z, elevated leverage, or a low overall fundamental score), and the
+conviction score now lets the scorecard nudge the quality component up or down.
+
+The generic score is blended with a **sector-specific scorecard** so each stock is
+judged against the failure modes that matter most for its business model:
+
+| sector | examples of added checks |
+|--------|--------------------------|
+| Technology / Communication Services | Rule of 40, gross margin, R&D intensity, SBC burden, net cash |
+| Financial Services | ROE, price/book discipline, ROE-to-P/B, equity/assets, dividend yield |
+| Real Estate | debt/assets, FCF payout, dividend yield, P/B, FCF yield |
+| Energy / Materials | EV/EBITDA, net debt/EBITDA, FCF yield, shareholder yield, operating margin |
+| Healthcare | gross margin, R&D intensity, revenue growth, FCF conversion, net cash |
+| Consumer | gross/operating margin, inventory turnover, revenue growth, FCF conversion |
+| Utilities | dividend yield, payout ratio, leverage, interest coverage, FCF yield |
+
+Sector scores are shown directly in the dashboard and can add risk flags for
+sector-specific issues such as high stock-comp dilution, thin bank capitalization,
+REIT dividends not covered by FCF, or a weak sector score.
+
+A separate **Trend Score** checks whether the business is getting better or worse
+over the available annual history. It looks at revenue CAGR, gross/operating/FCF
+margin changes, share-count CAGR, debt CAGR, and earnings CAGR. This catches
+value traps where today's snapshot looks acceptable but margins are compressing,
+debt is growing faster than revenue, or dilution is eroding per-share upside.
+Trend warnings are shown as risk flags and are blended into the overall
+fundamental grade.
+
 ### Base cash-flow modes (`--base`)
 
 | mode   | base cash flow                                  | notes |
